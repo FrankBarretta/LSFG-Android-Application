@@ -84,7 +84,8 @@ enum class OverlayMode(val prefValue: String) {
 
 enum class CaptureSource(val prefValue: String) {
     MEDIA_PROJECTION("media_projection"),
-    SHIZUKU("shizuku");
+    SHIZUKU("shizuku"),
+    ROOT("root");
 
     companion object {
         fun fromPref(value: String?): CaptureSource =
