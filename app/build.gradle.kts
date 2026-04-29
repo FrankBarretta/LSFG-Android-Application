@@ -22,10 +22,18 @@ android {
 
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++20"
+                cppFlags += listOf(
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-fvisibility=hidden",
+                    "-fvisibility-inlines-hidden",
+                    "-ffunction-sections",
+                    "-fdata-sections"
+                )
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-29"
+                    "-DANDROID_PLATFORM=android-29",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections,--icf=safe"
                 )
             }
         }
@@ -105,6 +113,11 @@ android {
             useLegacyPackaging = false
         }
     }
+}
+
+composeCompiler {
+    enableStrongSkippingMode = true
+    reportsDestination = layout.buildDirectory.dir("compose_compiler")
 }
 
 dependencies {
