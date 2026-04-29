@@ -87,6 +87,15 @@ android {
             isDebuggable = false
             val relCfg = signingConfigs.getByName("release")
             signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
+            // ThinLTO: cross-TU inlining between lsfg_render_loop.cpp, framegen,
+            // dxbc and volk. NDK r27 supports it stably. Release-only because
+            // LTO link times are noticeably slower.
+            externalNativeBuild {
+                cmake {
+                    cppFlags += "-flto=thin"
+                    arguments += "-DCMAKE_SHARED_LINKER_FLAGS=-flto=thin -Wl,--gc-sections,--icf=safe"
+                }
+            }
         }
         debug {
             isMinifyEnabled = false
