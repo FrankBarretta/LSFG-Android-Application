@@ -102,6 +102,8 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("com.github.topjohnwu.libsu:core:5.3.0")
+    implementation("com.github.topjohnwu.libsu:service:5.3.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

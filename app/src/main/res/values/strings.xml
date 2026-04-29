@@ -72,7 +72,8 @@
     <string name="section_capture_mode">Capture mode</string>
     <string name="capture_mode_mediaprojection">MediaProjection</string>
     <string name="capture_mode_shizuku">Shizuku capture</string>
-    <string name="capture_mode_desc">MediaProjection captures through Android screen sharing. Shizuku capture uses a privileged UID-filtered target capture path, useful on devices whose MediaProjection includes overlays.</string>
+    <string name="capture_mode_root">Root capture</string>
+    <string name="capture_mode_desc">MediaProjection captures through Android screen sharing. Shizuku and Root capture use a privileged UID-filtered target capture path, useful on devices whose MediaProjection includes overlays.</string>
     <string name="param_frame_graph">Frame pacing graph</string>
     <string name="param_frame_graph_desc">Show a live plot of generated frame intervals in the overlay. Useful for diagnosing stutter.</string>
 

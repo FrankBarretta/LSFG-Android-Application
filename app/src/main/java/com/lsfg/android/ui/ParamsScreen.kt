@@ -644,6 +644,15 @@ fun OverlayDisplayScreen(nav: NavHostController) {
                     label = { Text(stringResource(R.string.capture_mode_shizuku)) },
                     modifier = Modifier.weight(1f),
                 )
+                FilterChip(
+                    selected = state.captureSource == CaptureSource.ROOT,
+                    onClick = {
+                        prefs.setCaptureSource(CaptureSource.ROOT)
+                        refreshConfigState(prefs)
+                    },
+                    label = { Text(stringResource(R.string.capture_mode_root)) },
+                    modifier = Modifier.weight(1f),
+                )
             }
         }
 
