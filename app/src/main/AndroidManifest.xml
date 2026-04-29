@@ -83,9 +83,13 @@
                 android:value="lsfg_shizuku_capture_pacing" />
         </service>
 
+        <!-- Extends com.topjohnwu.superuser.ipc.RootService (libsu), which itself
+             extends android.app.Service. Lint cannot resolve the parent across
+             the AAR boundary and flags Instantiatable; suppress the false positive. -->
         <service
             android:name=".session.RootCaptureService"
-            android:exported="false" />
+            android:exported="false"
+            tools:ignore="Instantiatable" />
 
         <service
             android:name=".session.LsfgAccessibilityService"
