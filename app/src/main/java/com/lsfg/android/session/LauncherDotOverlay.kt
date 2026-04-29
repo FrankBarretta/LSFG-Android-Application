@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Choreographer
 import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
@@ -106,6 +107,24 @@ class LauncherDotOverlay(
     private var iconDragStartX: Int = 0
     private var iconDragStartY: Int = 0
     private var iconDragMoved: Boolean = false
+    // Coalesce icon-drag updateViewLayout calls to one per vsync. Touch events
+    // can fire at 240+ Hz on flagships and each updateViewLayout is a Binder RPC
+    // to WindowManagerService, so without this the drag floods the system
+    // window thread.
+    private var iconDragFramePending: Boolean = false
+    private val iconDragFrameCallback = Choreographer.FrameCallback {
+        iconDragFramePending = false
+        val lp = params
+        val r = root
+        val wm = hostWm
+        if (lp != null && r != null && wm != null && r.isAttachedToWindow &&
+            lp.width != WindowManager.LayoutParams.MATCH_PARENT) {
+            lp.x = iconX
+            lp.y = iconY
+            runCatching { wm.updateViewLayout(r, lp) }
+                .onFailure { Log.w(TAG, "icon drag updateViewLayout failed", it) }
+        }
+    }
 
     fun show() {
         if (root != null) return
@@ -706,21 +725,21 @@ class LauncherDotOverlay(
                     if (iconDragMoved) {
                         iconX = (iconDragStartX + dx.toInt()).coerceIn(0, (screenW - iconSizePx).coerceAtLeast(0))
                         iconY = (iconDragStartY + dy.toInt()).coerceIn(0, (screenH - iconSizePx).coerceAtLeast(0))
-                        val lp = params
-                        val r = root
-                        val wm = hostWm
-                        if (lp != null && r != null && wm != null && r.isAttachedToWindow &&
-                            lp.width != WindowManager.LayoutParams.MATCH_PARENT) {
-                            lp.x = iconX
-                            lp.y = iconY
-                            runCatching { wm.updateViewLayout(r, lp) }
-                                .onFailure { Log.w(TAG, "icon drag updateViewLayout failed", it) }
+                        if (!iconDragFramePending) {
+                            iconDragFramePending = true
+                            Choreographer.getInstance().postFrameCallback(iconDragFrameCallback)
                         }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (iconDragMoved) {
+                        // Cancel any in-flight Choreographer drag callback so it
+                        // doesn't race with the snap-to-edge updateViewLayout below.
+                        if (iconDragFramePending) {
+                            Choreographer.getInstance().removeFrameCallback(iconDragFrameCallback)
+                            iconDragFramePending = false
+                        }
                         val centerX = iconX + iconSizePx / 2
                         val centerY = iconY + iconSizePx / 2
                         val nearLeft = centerX < screenW / 2

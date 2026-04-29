@@ -22,10 +22,18 @@ android {
 
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++20"
+                cppFlags += listOf(
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-fvisibility=hidden",
+                    "-fvisibility-inlines-hidden",
+                    "-ffunction-sections",
+                    "-fdata-sections"
+                )
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-29"
+                    "-DANDROID_PLATFORM=android-29",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections,--icf=safe"
                 )
             }
         }
@@ -70,7 +78,12 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             isDebuggable = false
             val relCfg = signingConfigs.getByName("release")
             signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
@@ -85,6 +98,11 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+}
+
+composeCompiler {
+    enableStrongSkippingMode = true
+    reportsDestination = layout.buildDirectory.dir("compose_compiler")
 }
 
 dependencies {

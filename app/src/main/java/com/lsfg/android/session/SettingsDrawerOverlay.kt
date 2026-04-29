@@ -13,6 +13,7 @@ import android.graphics.drawable.LayerDrawable
 import android.os.Build
 import android.util.Log
 import android.util.TypedValue
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -125,6 +126,23 @@ class SettingsDrawerOverlay(
     private var iconDragStartX: Int = 0
     private var iconDragStartY: Int = 0
     private var iconDragMoved: Boolean = false
+    // Coalesce per-event updateViewLayout into one Binder RPC per vsync. Without
+    // this, touch can fire 240+ Hz on flagships and each updateViewLayout is a
+    // round-trip to WindowManagerService.
+    private var iconDragFramePending: Boolean = false
+    private val iconDragFrameCallback = Choreographer.FrameCallback {
+        iconDragFramePending = false
+        val lp = params
+        val r = root
+        val wm = hostWindowManager
+        if (lp != null && r != null && wm != null && r.isAttachedToWindow &&
+            lp.width != WindowManager.LayoutParams.MATCH_PARENT) {
+            lp.x = iconX
+            lp.y = iconY
+            runCatching { wm.updateViewLayout(r, lp) }
+                .onFailure { Log.w(TAG, "icon drag updateViewLayout failed", it) }
+        }
+    }
 
     fun setBypassListener(l: BypassToggleListener) { bypassListener = l }
     fun setStopOverlayListener(l: StopOverlayListener) { stopListener = l }
@@ -387,16 +405,19 @@ class SettingsDrawerOverlay(
             thumb = buildSeekThumb()
             splitTrack = false
             var dragging = false
+            var pendingMultiplier = initial.multiplier
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) {
                     val m = (p + 2).coerceIn(2, 8)
                     multiplierValue.text = "${m}×"
                     if (fromUser) {
-                        prefs.setMultiplier(m)
-                        // Tap (not drag) fires only onProgressChanged — trigger reinit here too,
-                        // otherwise a tap-to-change writes prefs but never reaches the native
-                        // context until some other setting changes.
+                        pendingMultiplier = m
+                        // Tap (not drag) fires only onProgressChanged — write prefs +
+                        // trigger reinit immediately. During drag we coalesce both the
+                        // pref write and the reinit to onStopTrackingTouch to avoid
+                        // 60×/sec SharedPreferences writes (lock + async fsync).
                         if (!dragging) {
+                            prefs.setMultiplier(m)
                             Log.i(TAG, "live: multiplier tap → $m")
                             liveParamsListener?.onParamsChanged()
                         }
@@ -405,7 +426,8 @@ class SettingsDrawerOverlay(
                 override fun onStartTrackingTouch(seekBar: SeekBar?) { dragging = true }
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     dragging = false
-                    Log.i(TAG, "live: multiplier release")
+                    prefs.setMultiplier(pendingMultiplier)
+                    Log.i(TAG, "live: multiplier release → $pendingMultiplier")
                     liveParamsListener?.onParamsChanged()
                 }
             })
@@ -432,13 +454,15 @@ class SettingsDrawerOverlay(
             thumb = buildSeekThumb()
             splitTrack = false
             var dragging = false
+            var pendingFlowScale = initial.flowScale
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) {
                     val f = (0.25f + p * 0.05f).coerceIn(0.25f, 1.0f)
                     flowValue.text = "%.2f".format(f)
                     if (fromUser) {
-                        prefs.setFlowScale(f)
+                        pendingFlowScale = f
                         if (!dragging) {
+                            prefs.setFlowScale(f)
                             Log.i(TAG, "live: flowScale tap → $f")
                             liveParamsListener?.onParamsChanged()
                         }
@@ -447,7 +471,8 @@ class SettingsDrawerOverlay(
                 override fun onStartTrackingTouch(seekBar: SeekBar?) { dragging = true }
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     dragging = false
-                    Log.i(TAG, "live: flowScale release")
+                    prefs.setFlowScale(pendingFlowScale)
+                    Log.i(TAG, "live: flowScale release → $pendingFlowScale")
                     liveParamsListener?.onParamsChanged()
                 }
             })
@@ -1103,17 +1128,28 @@ class SettingsDrawerOverlay(
             progressDrawable = buildSeekTrack()
             thumb = buildSeekThumb()
             splitTrack = false
+            var dragging = false
+            var pendingFpsCap = initial.targetFpsCap
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) {
                     val v = fpsCapSteps[p.coerceIn(0, fpsCapSteps.size - 1)]
                     fpsCapValue.text = if (v <= 0) "Unlimited" else "${v} fps"
                     if (fromUser) {
-                        prefs.setTargetFpsCap(v)
+                        pendingFpsCap = v
+                        // pushPacing() is in-process and cheap — keep it live so the
+                        // pacing loop reflects the slider during drag. Defer the
+                        // SharedPreferences write to onStopTrackingTouch.
+                        if (!dragging) {
+                            prefs.setTargetFpsCap(v)
+                        }
                         pushPacing()
                     }
                 }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStartTrackingTouch(seekBar: SeekBar?) { dragging = true }
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    dragging = false
+                    prefs.setTargetFpsCap(pendingFpsCap)
+                }
             })
         })
 
@@ -1128,6 +1164,9 @@ class SettingsDrawerOverlay(
         })
 
         // Slider helper local to this builder so each slider can force preset→CUSTOM.
+        // onCommit writes a SharedPreferences entry; we coalesce it to the slider
+        // release event during drag (avoids ~60 prefs writes/sec). The live native
+        // push (pushPacing) stays per-tick — it is in-process and cheap.
         fun attachAdvancedSlider(
             bar: SeekBar,
             valueView: TextView,
@@ -1144,12 +1183,18 @@ class SettingsDrawerOverlay(
             bar.thumb = buildSeekThumb()
             bar.splitTrack = false
             valueView.text = format(initialValue)
+            var dragging = false
+            var pendingValue = initialValue
             bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, p: Int, fromUser: Boolean) {
                     val v = min + p * step
                     valueView.text = format(v)
                     if (fromUser && !applyingPreset) {
-                        onCommit(v)
+                        pendingValue = v
+                        if (!dragging) {
+                            // Tap (not drag) — commit prefs immediately.
+                            onCommit(v)
+                        }
                         if (currentPreset != PacingPreset.CUSTOM) {
                             currentPreset = PacingPreset.CUSTOM
                             prefs.setPacingPreset(PacingPreset.CUSTOM)
@@ -1158,8 +1203,13 @@ class SettingsDrawerOverlay(
                         pushPacing()
                     }
                 }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStartTrackingTouch(seekBar: SeekBar?) { dragging = true }
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    dragging = false
+                    if (!applyingPreset) {
+                        onCommit(pendingValue)
+                    }
+                }
             })
         }
 
@@ -2002,21 +2052,21 @@ class SettingsDrawerOverlay(
                     if (iconDragMoved) {
                         iconX = (iconDragStartX + dx.toInt()).coerceIn(0, (screenW - iconSizePx).coerceAtLeast(0))
                         iconY = (iconDragStartY + dy.toInt()).coerceIn(0, (screenH - iconSizePx).coerceAtLeast(0))
-                        val lp = params
-                        val r = root
-                        val wm = hostWindowManager
-                        if (lp != null && r != null && wm != null && r.isAttachedToWindow &&
-                            lp.width != WindowManager.LayoutParams.MATCH_PARENT) {
-                            lp.x = iconX
-                            lp.y = iconY
-                            runCatching { wm.updateViewLayout(r, lp) }
-                                .onFailure { Log.w(TAG, "icon drag updateViewLayout failed", it) }
+                        if (!iconDragFramePending) {
+                            iconDragFramePending = true
+                            Choreographer.getInstance().postFrameCallback(iconDragFrameCallback)
                         }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (iconDragMoved) {
+                        // Cancel any in-flight drag-frame callback so it doesn't
+                        // race with the snap-to-edge updateViewLayout below.
+                        if (iconDragFramePending) {
+                            Choreographer.getInstance().removeFrameCallback(iconDragFrameCallback)
+                            iconDragFramePending = false
+                        }
                         // Snap to nearest horizontal edge and infer the slide-in side
                         // for the panel from the icon's current position.
                         val centerX = iconX + iconSizePx / 2
