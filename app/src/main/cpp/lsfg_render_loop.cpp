@@ -449,7 +449,7 @@ void recordOverlayPost() {
 // Qualcomm revisions). Keeping the code path in-tree with aggressive logging
 // so future device revisions / validation work can flip this flag without
 // another refactor. To enable for testing, set `kEnableWsiSwapchain` to true.
-constexpr bool kEnableWsiSwapchain = false;
+constexpr bool kEnableWsiSwapchain = true;
 
 void destroySwapchain() {
     // Must drain every in-flight ring submission before touching the images
@@ -1932,7 +1932,6 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs) {
     // often share content. The hash check is ~50-100 μs and runs on the
     // capture thread — doesn't block the worker.
     const uint32_t hash = captureContentHash(ahb);
-    bool duplicateForShizuku = false;
     if (hash != 0u) {
         std::lock_guard<std::mutex> hashLock(g.captureHashMu);
         if (!g.lastCaptureHashValid) {
@@ -1944,12 +1943,15 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs) {
             g.lastCaptureHash = hash;
             g.uniqueCaptures.fetch_add(1, std::memory_order_relaxed);
         } else {
-            duplicateForShizuku = g.shizukuTimingEnabled.load(std::memory_order_relaxed);
+            // Duplicate frame — pixel content is identical to the previous
+            // capture. MediaProjection delivers at the display refresh rate
+            // (often 120 Hz) regardless of the target app's render rate;
+            // at 30 FPS game output, ~75% of captures are duplicates.
+            // Processing them through the full framegen pipeline
+            // (import -> copy -> present -> waitIdle -> blit) wastes GPU
+            // time and causes queue saturation / teeth-shaped pacing.
+            return;
         }
-    }
-
-    if (duplicateForShizuku) {
-        return;
     }
 
     AHardwareBuffer_acquire(ahb);
