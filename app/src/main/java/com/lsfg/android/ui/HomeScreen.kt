@@ -334,6 +334,17 @@ fun HomeScreen(nav: NavHostController) {
                         }
                         return@SessionCTA
                     }
+                    if (state.captureSource == CaptureSource.ROOT) {
+                        ContextCompat.startForegroundService(
+                            ctx,
+                            LsfgForegroundService.buildRootStartIntent(
+                                ctx = ctx,
+                                targetPackage = targetPkg,
+                                fpsCounter = prefs.load().fpsCounterEnabled,
+                            ),
+                        )
+                        return@SessionCTA
+                    }
                     pendingCaptureSource = CaptureSource.MEDIA_PROJECTION
                     val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                         mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice())
@@ -356,13 +367,14 @@ fun HomeScreen(nav: NavHostController) {
                         .padding(top = 6.dp),
                 )
                 Text(
-                    text = if (canStart)
-                        if (state.captureSource == CaptureSource.SHIZUKU)
+                    text = if (canStart) when (state.captureSource) {
+                        CaptureSource.SHIZUKU ->
                             "Ready to start in Shizuku capture mode. Frames are captured from the target UID so the LSFG overlay is not fed back into itself."
-                        else
+                        CaptureSource.ROOT ->
+                            "Ready to start in root capture mode. Frames are captured from the target UID with root privilege — no recording dialog."
+                        else ->
                             "Ready to start. When Android asks what to share, choose the target app, not the entire screen."
-                    else
-                        "Complete steps 1 and 2 below to enable the session.",
+                    } else "Complete steps 1 and 2 below to enable the session.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.fillMaxWidth(),
@@ -415,6 +427,24 @@ fun HomeScreen(nav: NavHostController) {
                     Spacer(Modifier.height(4.dp))
                     Text(
                         text = "Uses Shizuku's privileged UID-filtered capture for the target app, avoiding MediaProjection overlay feedback. Requires the Shizuku app, Shizuku permission, and ADB or wireless debugging active before starting.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
+        if (state.captureSource == CaptureSource.ROOT) {
+            LsfgCard {
+                Column {
+                    Text(
+                        text = "ROOT CAPTURE",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = LsfgPrimary,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Uses root UID-filtered capture for the target app — no MediaProjection consent dialog. Requires root access granted to LLS in your root manager (Magisk / KernelSU / APatch).",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -496,8 +526,11 @@ fun HomeScreen(nav: NavHostController) {
 
         val overlayDisplaySummary = buildString {
             append(
-                if (state.captureSource == CaptureSource.SHIZUKU) "Shizuku capture"
-                else "MediaProjection",
+                when (state.captureSource) {
+                    CaptureSource.SHIZUKU -> "Shizuku capture"
+                    CaptureSource.ROOT -> "Root capture"
+                    else -> "MediaProjection"
+                },
             )
             append(" · ")
             append(
@@ -515,7 +548,11 @@ fun HomeScreen(nav: NavHostController) {
             title = stringResource(R.string.nav_overlay_display),
             subtitle = overlayDisplaySummary,
             status = StatusTone.Neutral,
-            statusLabel = if (state.captureSource == CaptureSource.SHIZUKU) "Shizuku" else "MP",
+            statusLabel = when (state.captureSource) {
+                CaptureSource.SHIZUKU -> "Shizuku"
+                CaptureSource.ROOT -> "Root"
+                else -> "MP"
+            },
             onClick = { nav.navigate(Routes.OVERLAY_DISPLAY) },
         )
 

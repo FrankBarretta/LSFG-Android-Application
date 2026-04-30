@@ -43,6 +43,7 @@ class LsfgForegroundService : Service() {
     private var projection: MediaProjection? = null
     private var capture: CaptureEngine? = null
     private var shizukuCapture: ShizukuCaptureEngine? = null
+    private var rootCapture: RootCaptureEngine? = null
     private var overlay: OverlayManager? = null
     private var drawer: SettingsDrawerOverlay? = null
     private var targetPkgPending: String? = null
@@ -77,7 +78,7 @@ class LsfgForegroundService : Service() {
     private var shuttingDown: Boolean = false
     @Volatile
     private var pendingFpsCounter: Boolean = false
-    private var pendingShizukuVideoStart: ShizukuVideoStart? = null
+    private var pendingPrivilegedVideoStart: ShizukuVideoStart? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     // Display rotation listener — Service.onConfigurationChanged only fires
     // for configChanges declared in the manifest, but services can't declare
@@ -172,6 +173,8 @@ class LsfgForegroundService : Service() {
         capture = null
         shizukuCapture?.stop()
         shizukuCapture = null
+        rootCapture?.stop()
+        rootCapture = null
         runCatching { NativeBridge.setShizukuTimingEnabled(false) }
             .onFailure { LsfgLog.w(TAG, "setShizukuTimingEnabled(false) failed during teardown", it) }
         if (lsfgContextActive) {
@@ -192,8 +195,9 @@ class LsfgForegroundService : Service() {
 
     private fun handleStart(intent: Intent) {
         val captureSource = CaptureSource.fromPref(intent.getStringExtra(EXTRA_CAPTURE_SOURCE))
-        runCatching { NativeBridge.setShizukuTimingEnabled(captureSource == CaptureSource.SHIZUKU) }
-            .onFailure { LsfgLog.w(TAG, "setShizukuTimingEnabled(${captureSource == CaptureSource.SHIZUKU}) failed", it) }
+        val isPrivilegedCapture = captureSource == CaptureSource.SHIZUKU || captureSource == CaptureSource.ROOT
+        runCatching { NativeBridge.setShizukuTimingEnabled(isPrivilegedCapture) }
+            .onFailure { LsfgLog.w(TAG, "setShizukuTimingEnabled($isPrivilegedCapture) failed", it) }
         val usesMediaProjectionVideo = captureSource == CaptureSource.MEDIA_PROJECTION
         // Pick the FGS type that matches what we'll actually do this session.
         // - MediaProjection capture → FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
@@ -272,16 +276,27 @@ class LsfgForegroundService : Service() {
                     ov.updateStatus(msg)
                 }
             }
-        } else {
-            null
-        }
+        } else null
         shizukuCapture = shizukuCap
+        val rootCap = if (captureSource == CaptureSource.ROOT) {
+            RootCaptureEngine(this).also { engine ->
+                engine.setErrorListener { msg ->
+                    LsfgLog.w(TAG, msg)
+                    ov.updateStatus(msg)
+                }
+            }
+        } else null
+        rootCapture = rootCap
         cap?.setFpsListener { captured, posted -> ov.updateFps(captured, posted) }
         cap?.setFrameGraphListener { realFps, genFps ->
             ov.pushFrameGraphSample(realFps, genFps)
         }
         shizukuCap?.setFpsListener { captured, posted -> ov.updateFps(captured, posted) }
         shizukuCap?.setFrameGraphListener { realFps, genFps ->
+            ov.pushFrameGraphSample(realFps, genFps)
+        }
+        rootCap?.setFpsListener { captured, posted -> ov.updateFps(captured, posted) }
+        rootCap?.setFrameGraphListener { realFps, genFps ->
             ov.pushFrameGraphSample(realFps, genFps)
         }
         // Apply persisted LSFG on/off preference before the first frame is captured. The drawer
@@ -391,19 +406,20 @@ class LsfgForegroundService : Service() {
                         activeRenderW = w
                         activeRenderH = h
                         cap?.setLsfgNativeInputEnabled(true)
-                        if (captureSource == CaptureSource.SHIZUKU) {
-                            pendingShizukuVideoStart = ShizukuVideoStart(w, h, cfg)
+                        if (isPrivilegedCapture) {
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
                         }
                         ov.updateStatus("LSFG: frame-gen active ${w}×${h} ×${cfg.multiplier}")
                     }
                     rc > 0 -> {
                         LsfgLog.w(TAG, "initContext rc=$rc — framegen disabled, staying in mirror mode")
                         lsfgContextActive = true
-                        if (captureSource == CaptureSource.SHIZUKU) {
+                        if (isPrivilegedCapture) {
                             activeRenderW = 0
                             activeRenderH = 0
-                            pendingShizukuVideoStart = ShizukuVideoStart(w, h, cfg)
-                            ov.updateStatus("LSFG: Shizuku mirror ${w}×${h} (GPU lacks required Vulkan ext)")
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
+                            val label = if (captureSource == CaptureSource.ROOT) "Root" else "Shizuku"
+                            ov.updateStatus("LSFG: $label mirror ${w}×${h} (GPU lacks required Vulkan ext)")
                         } else if (cap != null) {
                             cap.setSurface(surface, w, h)
                             activeRenderW = 0
@@ -421,9 +437,10 @@ class LsfgForegroundService : Service() {
                         LsfgLog.w(TAG, "initContext failed rc=$rc — staying in mirror mode")
                         activeRenderW = 0
                         activeRenderH = 0
-                        if (captureSource == CaptureSource.SHIZUKU && rc > 0) {
-                            pendingShizukuVideoStart = ShizukuVideoStart(w, h, cfg)
-                            ov.updateStatus("LSFG: Shizuku mirror active ${w}×${h} (init rc=$rc)")
+                        if (isPrivilegedCapture && rc > 0) {
+                            pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
+                            val label = if (captureSource == CaptureSource.ROOT) "Root" else "Shizuku"
+                            ov.updateStatus("LSFG: $label mirror active ${w}×${h} (init rc=$rc)")
                         } else if (cap != null) {
                             ov.updateStatus("LSFG: mirror active ${w}×${h} (init rc=$rc)")
                         } else {
@@ -438,10 +455,11 @@ class LsfgForegroundService : Service() {
                 if (pkg != null) {
                     targetPkgPending = null
                     launchTarget(pkg)
-                    pendingShizukuVideoStart?.let { start ->
-                        pendingShizukuVideoStart = null
+                    pendingPrivilegedVideoStart?.let { start ->
+                        pendingPrivilegedVideoStart = null
                         mainHandler.postDelayed({
                             startShizukuVideo(shizukuCap, pkg, start.width, start.height, start.cfg)
+                            startRootVideo(rootCap, pkg, start.width, start.height, start.cfg)
                         }, 500L)
                     }
                     // Re-assert the overlay on top a few times to win a potential race
@@ -457,13 +475,12 @@ class LsfgForegroundService : Service() {
                 if (pendingFpsCounter) {
                     pendingFpsCounter = false
                     runCatching {
-                        if (captureSource == CaptureSource.SHIZUKU) {
-                            shizukuCap?.startFpsCounter()
-                        } else {
-                            cap?.startFpsCounter()
+                        when {
+                            captureSource == CaptureSource.SHIZUKU -> shizukuCap?.startFpsCounter()
+                            captureSource == CaptureSource.ROOT -> rootCap?.startFpsCounter()
+                            else -> cap?.startFpsCounter()
                         }
-                    }
-                        .onFailure { LsfgLog.w(TAG, "startFpsCounter failed", it) }
+                    }.onFailure { LsfgLog.w(TAG, "startFpsCounter failed", it) }
                 }
             } else if (!lsfgContextActive || activeRenderW == 0) {
                 // Mirror mode (framegen disabled or context not yet active): retarget
@@ -501,10 +518,10 @@ class LsfgForegroundService : Service() {
         val initialFrameGraph = LsfgPreferences(this).load().frameGraphEnabled
         if (initialFrameGraph) {
             ov.setFrameGraphVisible(true)
-            if (captureSource == CaptureSource.SHIZUKU) {
-                shizukuCapture?.startFrameGraph()
-            } else {
-                capture?.startFrameGraph()
+            when {
+                captureSource == CaptureSource.SHIZUKU -> shizukuCapture?.startFrameGraph()
+                captureSource == CaptureSource.ROOT -> rootCapture?.startFrameGraph()
+                else -> capture?.startFrameGraph()
             }
         }
 
@@ -526,30 +543,32 @@ class LsfgForegroundService : Service() {
         dr.setFpsCounterListener { enabled ->
             LsfgLog.i(TAG, "fpsCounter=$enabled")
             if (enabled) {
-                if (captureSource == CaptureSource.SHIZUKU) {
-                    shizukuCapture?.startFpsCounter()
-                } else {
-                    capture?.startFpsCounter()
+                when {
+                    captureSource == CaptureSource.SHIZUKU -> shizukuCapture?.startFpsCounter()
+                    captureSource == CaptureSource.ROOT -> rootCapture?.startFpsCounter()
+                    else -> capture?.startFpsCounter()
                 }
                 overlay?.setFpsVisible(true)
             } else {
                 capture?.stopFpsCounter()
                 shizukuCapture?.stopFpsCounter()
+                rootCapture?.stopFpsCounter()
                 overlay?.setFpsVisible(false)
             }
         }
         dr.setFrameGraphListener { enabled ->
             LsfgLog.i(TAG, "frameGraph=$enabled")
             if (enabled) {
-                if (captureSource == CaptureSource.SHIZUKU) {
-                    shizukuCapture?.startFrameGraph()
-                } else {
-                    capture?.startFrameGraph()
+                when {
+                    captureSource == CaptureSource.SHIZUKU -> shizukuCapture?.startFrameGraph()
+                    captureSource == CaptureSource.ROOT -> rootCapture?.startFrameGraph()
+                    else -> capture?.startFrameGraph()
                 }
                 overlay?.setFrameGraphVisible(true)
             } else {
                 capture?.stopFrameGraph()
                 shizukuCapture?.stopFrameGraph()
+                rootCapture?.stopFrameGraph()
                 overlay?.setFrameGraphVisible(false)
             }
         }
@@ -624,6 +643,8 @@ class LsfgForegroundService : Service() {
                         .onFailure { LsfgLog.w(TAG, "pauseLsfgInput failed", it) }
                     runCatching { shizukuCapture?.pauseCapture() }
                         .onFailure { LsfgLog.w(TAG, "pause Shizuku capture failed", it) }
+                    runCatching { rootCapture?.pauseCapture() }
+                        .onFailure { LsfgLog.w(TAG, "pause Root capture failed", it) }
                     runCatching { NativeBridge.destroyContext() }
                     lsfgContextActive = false
                 }
@@ -685,9 +706,9 @@ class LsfgForegroundService : Service() {
                         activeRenderH = targetH
                         cap?.setLsfgMode(targetW, targetH)
                         cap?.setLsfgNativeInputEnabled(true)
-                        if (shizukuCapture != null) {
-                            startShizukuVideo(shizukuCapture, targetPkgPending ?: LsfgPreferences(this).load().targetPackage, targetW, targetH, cfg)
-                        }
+                        val reinitTarget = targetPkgPending ?: LsfgPreferences(this).load().targetPackage
+                        startShizukuVideo(shizukuCapture, reinitTarget, targetW, targetH, cfg)
+                        startRootVideo(rootCapture, reinitTarget, targetW, targetH, cfg)
                         mainHandler.post {
                             ov.updateStatus("LSFG: ${lastSurfaceW}×${lastSurfaceH} ×${cfg.multiplier} flow=${"%.2f".format(cfg.flowScale)}")
                         }
@@ -696,12 +717,12 @@ class LsfgForegroundService : Service() {
                         activeRenderW = 0
                         activeRenderH = 0
                         if (surface != null) cap?.setSurface(surface, targetW, targetH)
-                        if (shizukuCapture != null) {
-                            startShizukuVideo(shizukuCapture, targetPkgPending ?: LsfgPreferences(this).load().targetPackage, targetW, targetH, cfg)
-                        }
+                        val reinitTarget = targetPkgPending ?: LsfgPreferences(this).load().targetPackage
+                        startShizukuVideo(shizukuCapture, reinitTarget, targetW, targetH, cfg)
+                        startRootVideo(rootCapture, reinitTarget, targetW, targetH, cfg)
                         mainHandler.post {
-                            if (shizukuCapture != null && cap != null) {
-                                ov.updateStatus("LSFG: Shizuku capture unavailable for mirror fallback (frame-gen unavailable)")
+                            if ((shizukuCapture != null || rootCapture != null) && cap != null) {
+                                ov.updateStatus("LSFG: privileged capture unavailable for mirror fallback (frame-gen unavailable)")
                             } else if (cap != null) {
                                 ov.updateStatus("LSFG: mirror ${width}×${height} (GPU lacks required Vulkan ext)")
                             } else {
@@ -745,6 +766,17 @@ class LsfgForegroundService : Service() {
 
     private fun startShizukuVideo(
         engine: ShizukuCaptureEngine?,
+        targetPackage: String?,
+        width: Int,
+        height: Int,
+        cfg: com.lsfg.android.prefs.LsfgConfig,
+    ) {
+        if (engine == null || targetPackage == null) return
+        engine.startCapture(targetPackage, width, height, maxCaptureFps(cfg))
+    }
+
+    private fun startRootVideo(
+        engine: RootCaptureEngine?,
         targetPackage: String?,
         width: Int,
         height: Int,
@@ -842,6 +874,16 @@ class LsfgForegroundService : Service() {
             .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
             .putExtra(EXTRA_FPS_COUNTER, fpsCounter)
             .putExtra(EXTRA_CAPTURE_SOURCE, CaptureSource.SHIZUKU.prefValue)
+
+        fun buildRootStartIntent(
+            ctx: Context,
+            targetPackage: String?,
+            fpsCounter: Boolean,
+        ): Intent = Intent(ctx, LsfgForegroundService::class.java)
+            .setAction(ACTION_START)
+            .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
+            .putExtra(EXTRA_FPS_COUNTER, fpsCounter)
+            .putExtra(EXTRA_CAPTURE_SOURCE, CaptureSource.ROOT.prefValue)
 
         fun stop(ctx: Context) {
             ctx.startService(
