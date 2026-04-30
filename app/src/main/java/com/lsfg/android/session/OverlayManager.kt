@@ -8,8 +8,10 @@ import android.graphics.SurfaceTexture
 import android.os.Build
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.Surface
+import android.view.SurfaceControl
 import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
@@ -56,6 +58,8 @@ class OverlayManager(private val ctx: Context) {
     private var graphView: FrameGraphView? = null
     private var insetsListener: Any? = null
     private var internalInsetsListener: Any? = null
+    private var frameLoopCallback: Choreographer.FrameCallback? = null
+    private var surfaceTextureUpdateCount = 0
 
     @Volatile
     private var surfaceReadyListener: ((Surface, Int, Int) -> Unit)? = null
@@ -148,6 +152,10 @@ class OverlayManager(private val ctx: Context) {
         // No FLAG_NOT_TOUCHABLE: that flag, combined with TYPE_APPLICATION_OVERLAY, is
         // what triggers the Android 12+ 0.8-alpha clamp. Pass-through is handled by an
         // empty touchable region (installed right after addView).
+        // FLAG_SECURE is intentionally absent: on MediaTek/OEM ROMs it composites the
+        // window as opaque black on VirtualDisplays (MediaProjection), making every
+        // captured frame black. Exclusion from capture is handled by installSkipScreenshot
+        // via the eSkipScreenshot SurfaceFlinger layer flag instead.
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -160,7 +168,7 @@ class OverlayManager(private val ctx: Context) {
             screenH,
             layoutType,
             flags,
-            PixelFormat.OPAQUE,
+            PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 0
@@ -177,6 +185,17 @@ class OverlayManager(private val ctx: Context) {
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
+            // PRIVATE_FLAG_EXCLUDE_FROM_SCREEN_CAPTURE (0x00080000, API 31+): instructs
+            // WMS to tell SurfaceFlinger to skip this window in VirtualDisplay/screenshot
+            // composition at window-creation time — no SurfaceControl timing race.
+            runCatching {
+                val f = javaClass.getDeclaredField("privateFlags")
+                f.isAccessible = true
+                f.setInt(this, f.getInt(this) or 0x00080000)
+                Log.i("lsfg-vk-loop", "privateFlags EXCLUDE_FROM_SCREEN_CAPTURE applied")
+            }.onFailure {
+                Log.d("lsfg-vk-loop", "privateFlags field unavailable: ${it.message}")
+            }
         }
 
         // FrameLayout background stays transparent — TextureView composites into
@@ -185,9 +204,23 @@ class OverlayManager(private val ctx: Context) {
         // visible against the underlying app instead of a black slab.
         val layout = FrameLayout(ctx)
         val tex = TextureView(ctx)
-        tex.isOpaque = true
+        // Must be false: isOpaque=true signals the hardware composer that the
+        // layer is always opaque, causing HWC to skip compositing underlying
+        // layers (the game) for VirtualDisplay/MediaProjection output.  With
+        // opaque=true, even an alpha=0 cleared surface appears as opaque black
+        // in the capture feed, seeding the dark feedback loop.  false lets the
+        // compositor see through transparent pixels to the game content.
+        tex.isOpaque = false
         tex.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                // Re-apply skip-screenshot now that the window's SurfaceControl is
+                // guaranteed to have a valid native handle. The call in show() fires
+                // immediately after wm.addView(), where isAttachedToWindow is already
+                // true (ViewRootImpl.setView dispatches attachment synchronously) but
+                // the SurfaceControl native handle is only assigned later during
+                // relayoutWindow() — which completes before the first onSurfaceTextureAvailable.
+                installSkipScreenshot(layout)
+
                 // Pin the producer-side buffer size to the physical screen so the
                 // VirtualDisplay's frames don't get scaled by the consumer.
                 st.setDefaultBufferSize(screenW, screenH)
@@ -195,10 +228,18 @@ class OverlayManager(private val ctx: Context) {
                 producerSurface = s
                 syncOverlayGeometry()
                 requestMaxRefreshRate(s)
-                Log.i(TAG, "TextureView surface available ${width}x${height} valid=${s.isValid}")
+                Log.i(TAG, "TextureView surface available ${width}x${height} valid=${s.isValid} hwAccel=${tex.isHardwareAccelerated}")
                 if (s.isValid) {
                     surfaceReadyListener?.invoke(s, overlayWidth, overlayHeight)
                 }
+                // Drive TextureView redraws explicitly via Choreographer. On some
+                // devices (MediaTek/Mali) the TextureView-internal onFrameAvailable
+                // → scheduleTraversals path silently stops after the first buffer,
+                // leaving the overlay frozen on frame 1. Calling invalidate() on
+                // every VSYNC ensures updateTexImage() is called whenever a new
+                // buffer is available, regardless of the internal mechanism.
+                surfaceTextureUpdateCount = 0
+                startFrameLoop(tex)
             }
 
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
@@ -216,6 +257,7 @@ class OverlayManager(private val ctx: Context) {
 
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                 Log.i(TAG, "TextureView surface destroyed")
+                stopFrameLoop()
                 surfaceLostListener?.invoke()
                 runCatching { producerSurface?.release() }
                 producerSurface = null
@@ -226,7 +268,12 @@ class OverlayManager(private val ctx: Context) {
                 return true
             }
 
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                val n = ++surfaceTextureUpdateCount
+                if (n <= 30 || n % 60 == 0) {
+                    Log.d(TAG, "onSurfaceTextureUpdated #$n")
+                }
+            }
         }
         val fps = TextView(ctx).apply {
             text = ""
@@ -274,6 +321,14 @@ class OverlayManager(private val ctx: Context) {
         )
 
         wm.addView(layout, params)
+
+        // Mark the overlay's SurfaceControl with skipScreenshot so SurfaceFlinger
+        // excludes it from virtual-display composition (MediaProjection) while still
+        // rendering it normally on the physical display.  This prevents the feedback
+        // loop where MediaProjection captures our overlay output instead of the live
+        // game when the overlay is opaque.
+        installSkipScreenshot(layout)
+
         // Two complementary pass-through mechanisms — we install both because each
         // is needed on a different subset of devices:
         //   1) AttachedSurfaceControl.setTouchableRegion(empty) — the modern API
@@ -514,6 +569,189 @@ class OverlayManager(private val ctx: Context) {
         runCatching { textureView?.surfaceTexture?.setDefaultBufferSize(newW, newH) }
             .onFailure { Log.w(TAG, "setDefaultBufferSize(${newW}x${newH}) failed", it) }
         Log.i(TAG, "Overlay geometry synced to ${newW}x${newH}")
+    }
+
+    /**
+     * Sets the overlay window's `eSkipScreenshot` SurfaceFlinger flag so SurfaceFlinger
+     * excludes it from VirtualDisplay composition (MediaProjection capture) while rendering
+     * it normally on the physical display.
+     *
+     * Reflection path:
+     *   View.getViewRootImpl() (@hide, API 11+) → ViewRootImpl
+     *   ViewRootImpl.getSurfaceControl() (@hide, API 29+) → window root SurfaceControl
+     *   SurfaceControl.Transaction.setSkipScreenshot(@hide, API 12+)
+     *
+     * Note: rootSurfaceControl/getRootSurfaceControl() returns AttachedSurfaceControl, not
+     * ViewRootImpl, so getSurfaceControl() would throw NoSuchMethodException on that path.
+     */
+    private fun installSkipScreenshot(host: View) {
+        val apply: () -> Unit = {
+            runCatching {
+                // getViewRootImpl() is @hide but stable since API 11 and returns ViewRootImpl
+                // directly — the object that owns the window's root SurfaceControl.
+                val viewRootImpl = host.javaClass.getMethod("getViewRootImpl").invoke(host)
+                    ?: error("getViewRootImpl() returned null (view not attached?)")
+
+                // Get the window's SurfaceControl.
+                // Primary path:   ViewRootImpl.getSurfaceControl() — @hide, API 29+.
+                // Fallback path:  direct ViewRootImpl.mSurfaceControl field — some OEM
+                //   ROMs (MediaTek Android 13 confirmed) strip the accessor method while
+                //   leaving the underlying field intact in the class hierarchy.
+                val sc: SurfaceControl = run {
+                    runCatching {
+                        viewRootImpl.javaClass.getMethod("getSurfaceControl")
+                            .invoke(viewRootImpl) as? SurfaceControl
+                    }.getOrNull()?.let { return@run it }
+
+                    var cls: Class<*>? = viewRootImpl.javaClass
+                    while (cls != null) {
+                        runCatching {
+                            cls!!.getDeclaredField("mSurfaceControl")
+                                .also { it.isAccessible = true }
+                                .get(viewRootImpl) as? SurfaceControl
+                        }.getOrNull()?.let {
+                            Log.d("lsfg-vk-loop", "installSkipScreenshot: SurfaceControl via ${cls!!.simpleName}.mSurfaceControl")
+                            return@run it
+                        }
+                        cls = cls.superclass
+                    }
+
+                    // Third fallback: enumerate all fields by type — catches OEM renames.
+                    val scFieldsFound = mutableListOf<String>()
+                    var typeCls: Class<*>? = viewRootImpl.javaClass
+                    while (typeCls != null) {
+                        for (field in typeCls!!.declaredFields) {
+                            if (SurfaceControl::class.java.isAssignableFrom(field.type)) {
+                                val fieldId = "${typeCls.simpleName}.${field.name}"
+                                scFieldsFound.add(fieldId)
+                                runCatching {
+                                    field.isAccessible = true
+                                    field.get(viewRootImpl) as? SurfaceControl
+                                }.getOrNull()?.let { found ->
+                                    Log.i("lsfg-vk-loop", "installSkipScreenshot: SurfaceControl via type-search: $fieldId")
+                                    return@run found
+                                }
+                            }
+                        }
+                        typeCls = typeCls.superclass
+                    }
+                    Log.i("lsfg-vk-loop", "installSkipScreenshot: type-search SC-typed fields: $scFieldsFound")
+
+                    // Fourth fallback: Android 12+ BLAST pipeline — ViewRootImpl stores a
+                    // BLASTBufferQueue which owns the window's SurfaceControl internally.
+                    // Some OEM ROMs strip all direct SC fields from ViewRootImpl but leave
+                    // the BLASTBufferQueue field intact.
+                    val bbqClass = runCatching {
+                        Class.forName("android.graphics.BLASTBufferQueue")
+                    }.getOrNull()
+                    if (bbqClass != null) {
+                        var bbqSearchCls: Class<*>? = viewRootImpl.javaClass
+                        outer@ while (bbqSearchCls != null) {
+                            for (field in bbqSearchCls!!.declaredFields) {
+                                if (bbqClass.isAssignableFrom(field.type)) {
+                                    runCatching {
+                                        field.isAccessible = true
+                                        val bbq = field.get(viewRootImpl) ?: return@runCatching
+                                        for (methodName in listOf(
+                                            "getSyncedSurfaceControl",
+                                            "getSurfaceControl",
+                                        )) {
+                                            runCatching {
+                                                bbq.javaClass.getMethod(methodName)
+                                                    .invoke(bbq) as? SurfaceControl
+                                            }.getOrNull()?.let { found ->
+                                                Log.i("lsfg-vk-loop",
+                                                    "installSkipScreenshot: SurfaceControl via " +
+                                                    "BLASTBufferQueue.${field.name}.$methodName()")
+                                                return@run found
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            bbqSearchCls = bbqSearchCls.superclass
+                        }
+                    }
+
+                    // All paths exhausted — dump surface/blast/buffer related field names from
+                    // the ViewRootImpl hierarchy so we can see what the OEM actually has.
+                    val relatedFields = mutableListOf<String>()
+                    var dumpCls: Class<*>? = viewRootImpl.javaClass
+                    while (dumpCls != null) {
+                        for (field in dumpCls!!.declaredFields) {
+                            val n = field.name.lowercase()
+                            if (n.contains("surface") || n.contains("blast") ||
+                                n.contains("buffer") || n.contains("mbbq") ||
+                                n == "msc" || n == "mwrl") {
+                                relatedFields.add(
+                                    "${dumpCls.simpleName}.${field.name}:${field.type.simpleName}"
+                                )
+                            }
+                        }
+                        dumpCls = dumpCls.superclass
+                    }
+                    Log.i("lsfg-vk-loop", "installSkipScreenshot: related fields dump: $relatedFields")
+                    error("getSurfaceControl() missing and no SurfaceControl field found in class hierarchy")
+                }
+
+                // Verify the native handle is non-zero — it is 0 if relayoutWindow()
+                // hasn't run yet. The onSurfaceTextureAvailable retry guarantees it is set.
+                val nativeHandle = runCatching {
+                    sc.javaClass.getDeclaredField("mNativeObject")
+                        .also { it.isAccessible = true }.getLong(sc)
+                }.getOrDefault(-1L)
+                Log.i("lsfg-vk-loop", "installSkipScreenshot: SurfaceControl nativeHandle=0x${nativeHandle.toString(16)}")
+                if (nativeHandle == 0L) {
+                    error("SurfaceControl native handle is 0 — relayoutWindow not yet run; onSurfaceTextureAvailable will retry")
+                }
+
+                // setSkipScreenshot (@hide) — layer skipped during VirtualDisplay composition
+                // (MediaProjection) but rendered normally on physical display.
+                val txn = SurfaceControl.Transaction()
+                val method = txn.javaClass.getMethod(
+                    "setSkipScreenshot",
+                    SurfaceControl::class.java,
+                    Boolean::class.javaPrimitiveType,
+                )
+                method.invoke(txn, sc, true)
+                txn.apply()
+                Log.i("lsfg-vk-loop", "installSkipScreenshot: OK — overlay excluded from MediaProjection")
+            }.onFailure {
+                Log.w("lsfg-vk-loop", "installSkipScreenshot FAILED (${it.javaClass.simpleName}): ${it.message}" +
+                           " — feedback loop may occur")
+            }
+        }
+
+        if (host.isAttachedToWindow) {
+            apply()
+        } else {
+            host.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) { apply() }
+                override fun onViewDetachedFromWindow(v: View) = Unit
+            })
+        }
+    }
+
+    private fun startFrameLoop(tex: TextureView) {
+        stopFrameLoop()
+        val cb = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (frameLoopCallback === this) {
+                    tex.invalidate()
+                    Choreographer.getInstance().postFrameCallback(this)
+                }
+            }
+        }
+        frameLoopCallback = cb
+        Choreographer.getInstance().postFrameCallback(cb)
+    }
+
+    private fun stopFrameLoop() {
+        val cb = frameLoopCallback
+        frameLoopCallback = null
+        if (cb != null) {
+            Choreographer.getInstance().removeFrameCallback(cb)
+        }
     }
 
     companion object {
