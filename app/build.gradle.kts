@@ -14,14 +14,22 @@ android {
         minSdk = 29
         targetSdk = 35
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "0.1.1"
 
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++20"
+                cppFlags += listOf(
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-fvisibility=hidden",
+                    "-fvisibility-inlines-hidden",
+                    "-ffunction-sections",
+                    "-fdata-sections"
+                )
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-29"
+                    "-DANDROID_PLATFORM=android-29",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections,--icf=safe"
                 )
             }
         }
@@ -78,6 +86,15 @@ android {
             }
             val relCfg = signingConfigs.getByName("release")
             signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
+            // ThinLTO: cross-TU inlining between lsfg_render_loop.cpp, framegen,
+            // dxbc and volk. NDK r27 supports it stably. Release-only because
+            // LTO link times are noticeably slower.
+            externalNativeBuild {
+                cmake {
+                    cppFlags += "-flto=thin"
+                    arguments += "-DCMAKE_SHARED_LINKER_FLAGS=-flto=thin -Wl,--gc-sections,--icf=safe"
+                }
+            }
         }
         debug {
             isMinifyEnabled = false
@@ -101,6 +118,11 @@ android {
             useLegacyPackaging = false
         }
     }
+}
+
+composeCompiler {
+    enableStrongSkippingMode = true
+    reportsDestination = layout.buildDirectory.dir("compose_compiler")
 }
 
 dependencies {

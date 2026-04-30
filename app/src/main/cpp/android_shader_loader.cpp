@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <unordered_map>
@@ -64,6 +65,20 @@ struct BindingOffsets {
     uint32_t setOffset{};
 };
 
+// SPIR-V header layout: [magic][version][generator][bound][schema]
+// Vulkan 1.1 supports up to SPIR-V 1.3 (0x00010300). The dxvk compiler
+// targets SPIR-V 1.6 which Mali rejects at JIT compilation time. Patch the
+// version word down so the driver accepts the bytecode.
+void cap_spirv_version(std::vector<uint8_t> &spirv) {
+    if (spirv.size() < 20) return;
+    uint32_t ver;
+    std::memcpy(&ver, spirv.data() + 4, 4);
+    if (ver > 0x00010300u) {
+        ver = 0x00010300u;
+        std::memcpy(spirv.data() + 4, &ver, 4);
+    }
+}
+
 std::vector<uint8_t> translate_dxbc_to_spirv(const std::vector<uint8_t> &bytecode) {
     dxvk::DxbcReader reader(reinterpret_cast<const char *>(bytecode.data()), bytecode.size());
     dxvk::DxbcModule module(reader);
@@ -107,6 +122,7 @@ std::vector<uint8_t> translate_dxbc_to_spirv(const std::vector<uint8_t> &bytecod
 
     std::vector<uint8_t> spirv(code.size());
     std::copy_n(reinterpret_cast<const uint8_t *>(code.data()), code.size(), spirv.data());
+    cap_spirv_version(spirv);
     return spirv;
 }
 
@@ -189,6 +205,7 @@ std::vector<uint8_t> load_cached_spirv(const std::string &cacheDir, uint32_t res
     f.seekg(0, std::ios::beg);
     std::vector<uint8_t> out(static_cast<size_t>(size));
     f.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(size));
+    cap_spirv_version(out);  // fix shaders cached before the SPIR-V 1.3 downgrade
     return out;
 }
 

@@ -126,6 +126,21 @@ struct State {
     ANativeWindow *outWindow = nullptr;
     uint32_t outWidth = 0;
     uint32_t outHeight = 0;
+    // Last geometry successfully passed to ANativeWindow_setBuffersGeometry.
+    // We guard the call so it only fires when parameters actually change —
+    // calling it on every blit triggers a SurfaceTexture buffer-queue
+    // reconfiguration on some drivers that discards queued frames, leaving
+    // the display frozen on the first posted frame.
+    uint32_t winGeomW = 0;
+    uint32_t winGeomH = 0;
+    int      winGeomFmt = 0;
+    // Feedback-loop gate: suppresses blits when framegen output luma is very
+    // dark, indicating setSkipScreenshot failed and MediaProjection is capturing
+    // the overlay instead of the game.  Keeping the overlay transparent lets the
+    // next capture see the real game and breaks the loop.
+    bool     lumaGateOpen      = false;
+    uint32_t lumaGateDarkCount = 0;
+    int64_t  lumaGateStartNs   = 0; // steady_clock ns at first suppressed dark frame
 
     // Pending frames to process. We acquire a ref on the AHB so it survives
     // beyond the caller's Image.close(). Drained by the worker thread.
@@ -822,6 +837,55 @@ bool blitOutputToSwapchain(const AhbImage &src) {
     return true;
 }
 
+// Transition a freshly-created AHB-backed inSlot image UNDEFINED→GENERAL
+// and release ownership to VK_QUEUE_FAMILY_EXTERNAL. This must be called once
+// per inSlot after createAhbImage so that every subsequent copyAhbImage can
+// acquire with oldLayout=GENERAL, preserving Mali AFRC state across frames.
+void initInSlotImageLayout(VkImage image) {
+    VkCommandBufferAllocateInfo cbai{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = g.vk.commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (g.vk.fn.vkAllocateCommandBuffers(g.vk.device, &cbai, &cb) != VK_SUCCESS) {
+        LOGE("initInSlotImageLayout: vkAllocateCommandBuffers failed");
+        return;
+    }
+    const VkCommandBufferBeginInfo bi{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    g.vk.fn.vkBeginCommandBuffer(cb, &bi);
+    // Transition UNDEFINED→GENERAL and release to EXTERNAL in one barrier.
+    const VkImageMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = 0,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = g.vk.computeFamilyIdx,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+        .image = image,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    g.vk.fn.vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    g.vk.fn.vkEndCommandBuffer(cb);
+    const VkSubmitInfo si{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cb,
+    };
+    g.vk.fn.vkQueueSubmit(g.vk.computeQueue, 1, &si, VK_NULL_HANDLE);
+    g.vk.fn.vkQueueWaitIdle(g.vk.computeQueue);
+    g.vk.fn.vkFreeCommandBuffers(g.vk.device, g.vk.commandPool, 1, &cb);
+    LOGI("initInSlotImageLayout: image=%p initialized to GENERAL/EXTERNAL", (void*)image);
+}
+
 // Copy `src` AhbImage into `dst` AhbImage on the compute queue using a
 // transient command buffer. Both images are AHB-backed so layouts are
 // EXTERNAL initially; we transition to TRANSFER_DST/SRC, copy, transition
@@ -871,7 +935,7 @@ bool copyAhbImage(const AhbImage &src, const AhbImage &dst) {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = 0,
         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,     // always GENERAL: set by initInSlotImageLayout and preserved by releaseDst
         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .srcQueueFamilyIndex = foreign,           // framegen had it last
         .dstQueueFamilyIndex = g.vk.computeFamilyIdx,
@@ -929,6 +993,18 @@ bool copyAhbImage(const AhbImage &src, const AhbImage &dst) {
         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 2, postBarriers);
 
+    // Flush GPU L2 to DRAM before the CPU reads via AHardwareBuffer_lock.
+    // Mali-G77 does not automatically flush the L2 on vkQueueWaitIdle, so
+    // AHardwareBuffer_lock(fence=-1) reads stale zeroes without this barrier.
+    const VkMemoryBarrier hostFlush{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    g.vk.fn.vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &hostFlush, 0, nullptr, 0, nullptr);
+
     g.vk.fn.vkEndCommandBuffer(cb);
 
     const VkSubmitInfo si{
@@ -936,7 +1012,13 @@ bool copyAhbImage(const AhbImage &src, const AhbImage &dst) {
         .commandBufferCount = 1,
         .pCommandBuffers = &cb,
     };
-    g.vk.fn.vkQueueSubmit(g.vk.computeQueue, 1, &si, VK_NULL_HANDLE);
+    const VkResult qsr = g.vk.fn.vkQueueSubmit(g.vk.computeQueue, 1, &si, VK_NULL_HANDLE);
+    if (qsr != VK_SUCCESS) {
+        LOGE("copyAhbImage vkQueueSubmit failed: %d dst=%ux%u", (int)qsr,
+             dst.extent.width, dst.extent.height);
+        g.vk.fn.vkFreeCommandBuffers(g.vk.device, g.vk.commandPool, 1, &cb);
+        return false;
+    }
     g.vk.fn.vkQueueWaitIdle(g.vk.computeQueue);
     g.vk.fn.vkFreeCommandBuffers(g.vk.device, g.vk.commandPool, 1, &cb);
     return true;
@@ -1222,17 +1304,26 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
         }
     }
 
-    // Make sure the window's geometry matches our output. set per call is cheap;
-    // it's a no-op if the values haven't changed.
     const uint32_t npuScale = g.npuPostProcessing && g.npuUpscaleFactor == 2
         ? 2U
         : 1U;
     const uint32_t targetW = out.extent.width * npuScale;
     const uint32_t targetH = out.extent.height * npuScale;
-    ANativeWindow_setBuffersGeometry(g.outWindow,
-        static_cast<int32_t>(targetW),
-        static_cast<int32_t>(targetH),
-        WINDOW_FORMAT_RGBA_8888);
+    // Only call setBuffersGeometry when parameters actually change.  On some
+    // drivers (MediaTek, certain Mali) calling it on every blit triggers a
+    // SurfaceTexture buffer-queue reconfiguration even when nothing changed,
+    // which discards already-queued frames and leaves the overlay frozen on
+    // the first successfully displayed buffer.
+    if (targetW != g.winGeomW || targetH != g.winGeomH || g.winGeomFmt != WINDOW_FORMAT_RGBA_8888) {
+        ANativeWindow_setBuffersGeometry(g.outWindow,
+            static_cast<int32_t>(targetW),
+            static_cast<int32_t>(targetH),
+            WINDOW_FORMAT_RGBA_8888);
+        g.winGeomW   = targetW;
+        g.winGeomH   = targetH;
+        g.winGeomFmt = WINDOW_FORMAT_RGBA_8888;
+        LOGI("blitOutputToWindow: setBuffersGeometry %ux%u fmt=RGBA8888", targetW, targetH);
+    }
 
     // Synchronization is handled by the producer side before calling into this
     // blit path:
@@ -1252,27 +1343,59 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
         return;
     }
     const uint32_t srcStrideBytes = desc.stride * 4;  // RGBA8888
-    const uint32_t blitLogIndex = g.blitLogCount.load(std::memory_order_relaxed);
-    if (blitLogIndex < 12) {
+
+    // Sample luma on every frame: needed for the feedback-loop gate (not just
+    // the first 30 blits).  32×18 grid keeps it cheap (~576 pixels).
+    uint64_t lumaSum = 0, alphaSum = 0;
+    uint32_t samples = 0;
+    {
         const auto *srcBytes = static_cast<const uint8_t *>(srcPtr);
-        const uint32_t sampleW = std::min<uint32_t>(desc.width, 32);
-        const uint32_t sampleH = std::min<uint32_t>(desc.height, 18);
-        uint64_t lumaSum = 0;
-        uint32_t samples = 0;
-        for (uint32_t sy = 0; sy < sampleH; ++sy) {
-            const uint32_t y = sampleH > 1 ? (sy * (desc.height - 1)) / (sampleH - 1) : 0;
-            for (uint32_t sx = 0; sx < sampleW; ++sx) {
-                const uint32_t x = sampleW > 1 ? (sx * (desc.width - 1)) / (sampleW - 1) : 0;
+        const uint32_t sW = std::min<uint32_t>(desc.width, 32);
+        const uint32_t sH = std::min<uint32_t>(desc.height, 18);
+        for (uint32_t sy = 0; sy < sH; ++sy) {
+            const uint32_t y = sH > 1 ? (sy * (desc.height - 1)) / (sH - 1) : 0;
+            for (uint32_t sx = 0; sx < sW; ++sx) {
+                const uint32_t x = sW > 1 ? (sx * (desc.width - 1)) / (sW - 1) : 0;
                 const uint8_t *p = srcBytes + y * srcStrideBytes + x * 4;
-                lumaSum += (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
-                samples++;
+                lumaSum  += (77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8u;
+                alphaSum += p[3];
+                ++samples;
             }
         }
-        const uint32_t avgLuma = samples > 0 ? static_cast<uint32_t>(lumaSum / samples) : 0;
-        if (g.blitLogCount.fetch_add(1, std::memory_order_relaxed) < 12) {
-            LOGI("blit #%u src=%ux%u stride=%u avgLuma=%u outWindow=%ux%u",
-                 blitLogIndex + 1, desc.width, desc.height, desc.stride,
-                 avgLuma, g.outWidth, g.outHeight);
+    }
+    const uint32_t avgLuma  = samples > 0 ? static_cast<uint32_t>(lumaSum  / samples) : 0;
+    const uint32_t avgAlpha = samples > 0 ? static_cast<uint32_t>(alphaSum / samples) : 0;
+
+    // Log first 30 blits.
+    {
+        const uint32_t idx = g.blitLogCount.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 30) {
+            LOGI("blit #%u src=%ux%u stride=%u avgLuma=%u avgAlpha=%u outWindow=%ux%u",
+                 idx + 1, desc.width, desc.height, desc.stride,
+                 avgLuma, avgAlpha, g.outWidth, g.outHeight);
+        }
+    }
+
+    // Feedback-loop gate: if setSkipScreenshot failed, MediaProjection captures
+    // our overlay (opaque dark) instead of the game, locking avgLuma near zero.
+    // Keep the overlay transparent (skip the blit) until a bright frame proves
+    // we are seeing real game content — the gate never force-opens, because a
+    // forced open on dark input re-establishes the feedback loop immediately.
+    // Once a bright frame (luma >= 30) arrives the gate latches open for the
+    // session so dark in-game scenes (fade-to-black, cutscenes) still get LSFG.
+    if (!g.lumaGateOpen) {
+        if (avgLuma >= 30u) {
+            g.lumaGateOpen = true;
+            LOGI("blitOutputToWindow: luma gate opened after %u dark frames (luma=%u)",
+                 g.lumaGateDarkCount, avgLuma);
+        } else {
+            ++g.lumaGateDarkCount;
+            if (g.lumaGateDarkCount <= 5u || g.lumaGateDarkCount % 300u == 0u) {
+                LOGI("blitOutputToWindow: dark frame suppressed (luma=%u count=%u) — overlay transparent",
+                     avgLuma, g.lumaGateDarkCount);
+            }
+            AHardwareBuffer_unlock(out.ahb, nullptr);
+            return; // keep overlay transparent — suppress dark feedback frame
         }
     }
 
@@ -1324,9 +1447,12 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
     if (!npuPosted) {
         const uint32_t copyW = std::min<uint32_t>(desc.width, static_cast<uint32_t>(dst.width));
         const uint32_t copyH = std::min<uint32_t>(desc.height, static_cast<uint32_t>(dst.height));
-        const uint32_t rowBytes = copyW * 4;
         for (uint32_t y = 0; y < copyH; ++y) {
-            std::memcpy(dest + y * dstStrideBytes, src + y * srcStrideBytes, rowBytes);
+            const uint32_t *sRow = reinterpret_cast<const uint32_t *>(src + y * srcStrideBytes);
+                  uint32_t *dRow = reinterpret_cast<      uint32_t *>(dest + y * dstStrideBytes);
+            for (uint32_t x = 0; x < copyW; ++x) {
+                dRow[x] = sRow[x] | 0xFF000000u;
+            }
         }
         producedW = copyW;
         producedH = copyH;
@@ -1349,7 +1475,10 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
         }
     }
 
-    ANativeWindow_unlockAndPost(g.outWindow);
+    const int postResult = ANativeWindow_unlockAndPost(g.outWindow);
+    if (postResult != 0) {
+        LOGW("ANativeWindow_unlockAndPost failed: %d (blit will not appear)", postResult);
+    }
     AHardwareBuffer_unlock(out.ahb, nullptr);
     // Count this as an overlay post (ground truth for HUD total-fps metric
     // and for the pacing graph's frame-interval samples).
@@ -1392,6 +1521,41 @@ void workerThread() {
     } prof{};
     constexpr uint32_t kProfileWindow = 60;
 
+    // Clear the overlay to fully transparent before the capture loop starts.
+    // The overlay ANativeWindow retains the last posted buffer across sessions,
+    // so a prior session that crashed or left dark content would be visible to
+    // MediaProjection immediately, seeding a dark-feedback loop on the very
+    // first captured frame.
+    if (g.outWindow != nullptr) {
+        ANativeWindow_setBuffersGeometry(g.outWindow,
+            static_cast<int32_t>(g.outWidth),
+            static_cast<int32_t>(g.outHeight),
+            WINDOW_FORMAT_RGBA_8888);
+        ANativeWindow_Buffer clearBuf{};
+        if (ANativeWindow_lock(g.outWindow, &clearBuf, nullptr) == 0) {
+            memset(clearBuf.bits, 0,
+                   static_cast<size_t>(clearBuf.stride) *
+                   static_cast<size_t>(clearBuf.height) * 4);
+            ANativeWindow_unlockAndPost(g.outWindow);
+            LOGI("workerThread: cleared overlay to transparent");
+        }
+    }
+
+    // Drain any frames that were buffered during shader compilation.  Those
+    // frames were captured while the overlay may have been dark (stale content
+    // from a prior session), so feeding them into framegen would re-seed the
+    // feedback loop.  Drop them now that we have posted a transparent clear.
+    {
+        std::unique_lock<std::mutex> lock(g.mu);
+        if (!g.pending.empty()) {
+            LOGI("workerThread: draining %zu stale init frames", g.pending.size());
+            for (auto &pf : g.pending) {
+                if (pf.ahb) AHardwareBuffer_release(pf.ahb);
+            }
+            g.pending.clear();
+        }
+    }
+
     while (true) {
         State::PendingFrame pendingFrame{};
         {
@@ -1425,6 +1589,44 @@ void workerThread() {
         const int newSlot = (g.presentsDone % 2 == 0) ? 0 : 1;
         const int prevSlot = 1 - newSlot;
 
+        // Diagnostic helper: CPU-lock any AHB and sample a 4×4 luma grid.
+        // Safe before copyAhbImage (no Vulkan queue ops yet on src) and after
+        // (vkQueueWaitIdle ran inside copyAhbImage / processRealFrameIntoSlot).
+        auto sampleAhb = [](AHardwareBuffer *a, const char *label) {
+            AHardwareBuffer_Desc d{};
+            AHardwareBuffer_describe(a, &d);
+            void *ptr = nullptr;
+            if (AHardwareBuffer_lock(a, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY,
+                    -1, nullptr, &ptr) != 0 || ptr == nullptr) {
+                LOGI("%s: lock failed", label);
+                return;
+            }
+            const auto *b = static_cast<const uint8_t*>(ptr);
+            const uint32_t stride = d.stride * 4;
+            uint64_t sum = 0;
+            for (uint32_t row = 0; row < 4; row++) {
+                for (uint32_t col = 0; col < 4; col++) {
+                    const uint32_t y = row * d.height / 4;
+                    const uint32_t x = col * d.width  / 4;
+                    const uint8_t *p = b + y * stride + x * 4;
+                    sum += (77u*p[0] + 150u*p[1] + 29u*p[2]) >> 8;
+                }
+            }
+            LOGI("%s: %ux%u stride=%u luma=%llu",
+                 label, d.width, d.height, d.stride,
+                 (unsigned long long)(sum / 16u));
+            AHardwareBuffer_unlock(a, nullptr);
+        };
+
+        // Pre-copy: sample the MediaProjection source AHB before any GPU work.
+        // Extended to 30 frames to capture any delayed dark-onset pattern.
+        if (g.framesCopied < 30) {
+            char lbl[40];
+            std::snprintf(lbl, sizeof(lbl), "pre_copy_src[%llu]",
+                         (unsigned long long)g.framesCopied);
+            sampleAhb(src.ahb, lbl);
+        }
+
         // Bootstrap: the very first capture has no predecessor, so seed BOTH
         // slots with the same pixels. That makes the optical flow for the first
         // present a no-op (same image on both inputs) and the output equals the
@@ -1445,6 +1647,22 @@ void workerThread() {
                 continue;
             }
         }
+        // Post-copy: verify the destination slot was written correctly.
+        // Extended to 8 copies to capture the frame-4 failure.
+        if (g.framesCopied < 8) {
+            auto sampleSlot = [&sampleAhb](int slot) {
+                char lbl[32];
+                std::snprintf(lbl, sizeof(lbl), "post_copy slot%d", slot);
+                sampleAhb(g.inSlot[slot].ahb, lbl);
+            };
+            if (g.framesCopied == 0) {
+                sampleSlot(0);
+                sampleSlot(1);
+            } else {
+                sampleSlot(newSlot);
+            }
+        }
+
         g.framesCopied++;
         bool suppressGeneratedFrames =
             g.antiArtifacts.load(std::memory_order_relaxed)
@@ -1789,6 +2007,9 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     }
     g.pushLogCount.store(0, std::memory_order_relaxed);
     g.blitLogCount.store(0, std::memory_order_relaxed);
+    g.lumaGateOpen      = false;
+    g.lumaGateDarkCount = 0;
+    g.lumaGateStartNs   = 0;
     g.shizukuSampleTimestampNs.store(0, std::memory_order_relaxed);
     g.shizukuFrameTimeNs.store(0, std::memory_order_relaxed);
     g.shizukuPacingJitterNs.store(0, std::memory_order_relaxed);
@@ -1824,6 +2045,7 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
             shutdownRenderLoop();
             return kRenderLoopBufferAlloc;
         }
+        initInSlotImageLayout(g.inSlot[i].image);
     }
     // Number of outputs = generationCount, matching framegen "level".
     g.outputs.resize(g.multiplier);
@@ -1915,10 +2137,10 @@ void setOutputSurface(ANativeWindow *win, uint32_t w, uint32_t h) {
 void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs) {
     if (ahb == nullptr) return;
     const uint32_t pushLogIndex = g.pushLogCount.load(std::memory_order_relaxed);
-    if (pushLogIndex < 12) {
+    if (pushLogIndex < 30) {
         AHardwareBuffer_Desc desc{};
         AHardwareBuffer_describe(ahb, &desc);
-        if (g.pushLogCount.fetch_add(1, std::memory_order_relaxed) < 12) {
+        if (g.pushLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
             LOGI("pushFrame #%u ahb=%ux%u stride=%u fmt=%u usage=0x%llx ts=%lld",
                  pushLogIndex + 1, desc.width, desc.height, desc.stride, desc.format,
                  static_cast<unsigned long long>(desc.usage),
@@ -2021,13 +2243,13 @@ void shutdownRenderLoop() {
         g.npuPost.reset();
         g.cpuPost.reset();
 
-        // Destroy swapchain (and its surface) before releasing the underlying
-        // ANativeWindow — surface destruction drops its internal window ref.
+        // Destroy swapchain (and its surface) before the underlying ANativeWindow
+        // is touched — surface destruction drops its internal window ref.
+        // g.outWindow is intentionally kept live so the worker thread can still
+        // blit during the next session's shader-compilation window (before
+        // setOutputSurface is called).  setOutputSurface always releases the
+        // old reference before acquiring the new one, so there is no leak.
         destroySwapchain();
-        if (g.outWindow != nullptr) {
-            ANativeWindow_release(g.outWindow);
-            g.outWindow = nullptr;
-        }
         g.swapWinW = 0;
         g.swapWinH = 0;
 
