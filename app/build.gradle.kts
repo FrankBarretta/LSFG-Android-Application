@@ -16,10 +16,6 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
-        }
-
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++20"
@@ -70,8 +66,16 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             isDebuggable = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            ndk {
+                debugSymbolLevel = "none"
+            }
             val relCfg = signingConfigs.getByName("release")
             signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
         }
@@ -80,9 +84,21 @@ android {
         }
     }
 
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
+        }
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 }

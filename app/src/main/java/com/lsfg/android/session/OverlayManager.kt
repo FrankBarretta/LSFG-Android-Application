@@ -49,7 +49,6 @@ import com.lsfg.android.prefs.VsyncRefreshOverride
 class OverlayManager(private val ctx: Context) {
 
     private var root: FrameLayout? = null
-    private var status: TextView? = null
     private var textureView: TextureView? = null
     private var producerSurface: Surface? = null
     private var hostWindowManager: WindowManager? = null
@@ -229,12 +228,6 @@ class OverlayManager(private val ctx: Context) {
 
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
         }
-        val tv = TextView(ctx).apply {
-            text = "LSFG: session starting…"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            setPadding(24, 24, 24, 24)
-        }
         val fps = TextView(ctx).apply {
             text = ""
             setTextColor(Color.WHITE)
@@ -251,22 +244,13 @@ class OverlayManager(private val ctx: Context) {
             ),
         )
         layout.addView(
-            tv,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.START,
-            ),
-        )
-        layout.addView(
             fps,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START,
             ).apply {
-                // Offset below the status line so the two don't overlap.
-                topMargin = 96
+                topMargin = 24
                 leftMargin = 24
             },
         )
@@ -284,7 +268,7 @@ class OverlayManager(private val ctx: Context) {
                 Gravity.TOP or Gravity.START,
             ).apply {
                 // Position just below the FPS text so both stay in the top-left cluster.
-                topMargin = 148
+                topMargin = 112
                 leftMargin = 24
             },
         )
@@ -304,7 +288,6 @@ class OverlayManager(private val ctx: Context) {
         insetsListener = installEmptyTouchableRegion(layout)
         internalInsetsListener = installEmptyInternalInsets(layout)
         root = layout
-        status = tv
         fpsView = fps
         graphView = graph
         textureView = tex
@@ -337,7 +320,8 @@ class OverlayManager(private val ctx: Context) {
     }
 
     fun updateStatus(line: String) {
-        status?.post { status?.text = line }
+        // Status text was removed from the overlay; keep the API as a no-op so
+        // existing call sites in the foreground service continue to compile.
     }
 
     fun setFpsVisible(visible: Boolean) {
@@ -377,7 +361,6 @@ class OverlayManager(private val ctx: Context) {
         runCatching { producerSurface?.release() }
         producerSurface = null
         root = null
-        status = null
         textureView = null
         fpsView = null
         hostWindowManager = null

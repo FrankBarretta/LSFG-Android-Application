@@ -24,6 +24,8 @@ import com.lsfg.android.prefs.CaptureSource
 import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.PacingDefaults
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Runs for the lifetime of an LSFG session. Owns the MediaProjection token, the
@@ -58,6 +60,12 @@ class LsfgForegroundService : Service() {
     private var activeRenderH: Int = 0
     @Volatile
     private var reinitInFlight: Boolean = false
+    // Signalled when the in-flight reinit thread finishes. Lets onDestroy() wait
+    // for completion without busy-polling the Main thread (the previous code
+    // burned ~75 cycles of Thread.sleep(20) before timeout, blocking the looper
+    // and starving system input — causing visible freeze on swipe-out).
+    @Volatile
+    private var reinitDoneLatch: CountDownLatch? = null
     // When the user changes a parameter while a previous reinit is still in
     // flight, we can't start a second one concurrently (it would race on the
     // native context). Instead we mark a pending request and the in-flight
@@ -162,12 +170,14 @@ class LsfgForegroundService : Service() {
         // images — SIGSEGV on the next access. This was the "stop overlay
         // crashes when settings stop applying" symptom.
         shuttingDown = true
-        val deadline = System.currentTimeMillis() + 1500
-        while (reinitInFlight && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20)
-        }
-        if (reinitInFlight) {
-            LsfgLog.w(TAG, "onDestroy: reinit still in flight after 1.5s — proceeding anyway")
+        // Wait on the latch instead of polling — frees the Main thread looper
+        // to deliver pending input events instead of sleeping in 20 ms ticks.
+        val latch = reinitDoneLatch
+        if (latch != null && reinitInFlight) {
+            val finished = latch.await(1500, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                LsfgLog.w(TAG, "onDestroy: reinit still in flight after 1.5s — proceeding anyway")
+            }
         }
         capture?.stop()
         capture = null
@@ -615,7 +625,10 @@ class LsfgForegroundService : Service() {
         reinitRequested = false
         pendingReinitW = width
         pendingReinitH = height
+        val doneLatch = CountDownLatch(1)
+        reinitDoneLatch = doneLatch
         Thread {
+            try {
             val cacheDir = File(filesDir, "spirv").absolutePath
             // Drain any pending requests that arrived while we were running.
             // Each pass re-reads prefs so the final native state matches the
@@ -736,7 +749,10 @@ class LsfgForegroundService : Service() {
                     activeRenderH = 0
                 }
             } while (reinitRequested)
-            reinitInFlight = false
+            } finally {
+                reinitInFlight = false
+                doneLatch.countDown()
+            }
         }.start()
     }
 

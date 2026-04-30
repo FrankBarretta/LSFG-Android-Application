@@ -66,6 +66,7 @@ class FrameGraphView(ctx: Context) : View(ctx) {
     }
 
     private val path = Path()
+    private val fillPath = Path()
 
     fun pushSample(realFps: Float, generatedFps: Float) {
         realSeries[head] = realFps.coerceAtLeast(0f)
@@ -128,7 +129,7 @@ class FrameGraphView(ctx: Context) : View(ctx) {
         val stepX = plotW / (historySize - 1).toFloat()
 
         fun drawSeries(series: FloatArray, stroke: Paint, fill: Paint) {
-            path.reset()
+            path.rewind()
             // Start path at the oldest sample's screen X; samples are a ring
             // buffer, so the oldest is at `head` when filled, else at 0.
             val start = if (filled < historySize) 0 else head
@@ -141,8 +142,10 @@ class FrameGraphView(ctx: Context) : View(ctx) {
                 val y = padT + plotH - (v / maxY) * plotH
                 if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
             }
-            // Close the fill region down to the x-axis.
-            val fillPath = Path(path)
+            // Close the fill region down to the x-axis. Reuse the member fillPath
+            // (rewind keeps the underlying capacity) to avoid per-frame allocation.
+            fillPath.rewind()
+            fillPath.addPath(path)
             fillPath.lineTo(padL + plotW, padT + plotH)
             fillPath.lineTo(padL + (historySize - count) * stepX, padT + plotH)
             fillPath.close()
