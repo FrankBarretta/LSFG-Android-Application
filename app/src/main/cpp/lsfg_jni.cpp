@@ -20,7 +20,7 @@
 
 namespace {
 
-constexpr const char *kVersion = "lsfg-android 0.2.0";
+constexpr const char *kVersion = "lsfg-android 0.1.1";
 
 std::string jstring_to_std(JNIEnv *env, jstring s) {
     if (s == nullptr) {
