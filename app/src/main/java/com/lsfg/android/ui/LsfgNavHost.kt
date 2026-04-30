@@ -20,6 +20,7 @@ object Routes {
     const val APP_PICKER = "app_picker"
     const val AUTOMATIC_OVERLAY = "automatic_overlay"
     const val TUTORIAL = "tutorial"
+    const val BENCHMARK = "benchmark"
 }
 
 private const val ANIM_MS = 240
@@ -51,5 +52,6 @@ fun LsfgNavHost(navController: NavHostController) {
         composable(Routes.APP_PICKER) { AppPickerScreen(navController) }
         composable(Routes.AUTOMATIC_OVERLAY) { AutomaticOverlayScreen(navController) }
         composable(Routes.TUTORIAL) { TutorialScreen(navController) }
+        composable(Routes.BENCHMARK) { BenchmarkScreen(navController) }
     }
 }

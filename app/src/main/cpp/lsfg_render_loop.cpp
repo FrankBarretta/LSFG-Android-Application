@@ -168,6 +168,19 @@ struct State {
 
     std::atomic<uint32_t> pushLogCount{0};
     std::atomic<uint32_t> blitLogCount{0};
+
+    // Snapshot of the last completed kProfileWindow rolling window. Updated
+    // atomically by the worker thread when a window closes (see workerThread,
+    // ProfileAccum). Layout: [copyNs, presentNs, waitIdleNs, blitNs, totalNs,
+    // samples]. Each value is the SUM over the window — divide by samples to
+    // get the per-frame average. samples == 0 means no window has completed
+    // since session start.
+    std::atomic<int64_t> profileSnapshotCopyNs{0};
+    std::atomic<int64_t> profileSnapshotPresentNs{0};
+    std::atomic<int64_t> profileSnapshotWaitIdleNs{0};
+    std::atomic<int64_t> profileSnapshotBlitNs{0};
+    std::atomic<int64_t> profileSnapshotTotalNs{0};
+    std::atomic<int64_t> profileSnapshotSamples{0};
     std::atomic<bool> shizukuTimingEnabled{false};
     std::atomic<int64_t> shizukuSampleTimestampNs{0};
     std::atomic<int64_t> shizukuFrameTimeNs{0};
@@ -1687,6 +1700,14 @@ void workerThread() {
                      (prof.blitNs / n)     / 1'000'000.0,
                      (prof.totalNs / n)    / 1'000'000.0,
                      g.multiplier, g.outputs.size());
+                // Publish the closed window so the benchmark JNI getter can
+                // surface segment averages without scraping logcat.
+                g.profileSnapshotCopyNs.store(prof.copyNs, std::memory_order_relaxed);
+                g.profileSnapshotPresentNs.store(prof.presentNs, std::memory_order_relaxed);
+                g.profileSnapshotWaitIdleNs.store(prof.waitIdleNs, std::memory_order_relaxed);
+                g.profileSnapshotBlitNs.store(prof.blitNs, std::memory_order_relaxed);
+                g.profileSnapshotTotalNs.store(prof.totalNs, std::memory_order_relaxed);
+                g.profileSnapshotSamples.store(prof.samples, std::memory_order_relaxed);
                 prof = ProfileAccum{};
             }
         } else {
@@ -2062,6 +2083,23 @@ uint64_t getPostedFrameCount() {
 
 uint64_t getUniqueCaptureCount() {
     return g.uniqueCaptures.load(std::memory_order_relaxed);
+}
+
+uint32_t getProfileWindowNs(int64_t *out, uint32_t cap) {
+    // out layout: [copyNs, presentNs, waitIdleNs, blitNs, totalNs, samples].
+    // Each value is the SUM over the last completed kProfileWindow window;
+    // divide by samples for per-frame averages. Returns 6 when populated, 0
+    // when no window has closed yet (samples==0) or when out is too small.
+    if (out == nullptr || cap < 6) return 0;
+    const int64_t samples = g.profileSnapshotSamples.load(std::memory_order_relaxed);
+    if (samples <= 0) return 0;
+    out[0] = g.profileSnapshotCopyNs.load(std::memory_order_relaxed);
+    out[1] = g.profileSnapshotPresentNs.load(std::memory_order_relaxed);
+    out[2] = g.profileSnapshotWaitIdleNs.load(std::memory_order_relaxed);
+    out[3] = g.profileSnapshotBlitNs.load(std::memory_order_relaxed);
+    out[4] = g.profileSnapshotTotalNs.load(std::memory_order_relaxed);
+    out[5] = samples;
+    return 6;
 }
 
 uint32_t getRecentPostIntervalsNs(int64_t *outIntervalsNs, uint32_t cap) {

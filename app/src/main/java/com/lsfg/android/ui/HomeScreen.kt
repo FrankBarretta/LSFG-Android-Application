@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Accessibility
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Gavel
 import androidx.compose.material.icons.filled.School
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -583,6 +584,12 @@ fun HomeScreen(nav: NavHostController) {
                     text = stringResource(R.string.nav_tutorial),
                     onClick = { nav.navigate(Routes.TUTORIAL) },
                     leadingIcon = Icons.Filled.School,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                LsfgSecondaryButton(
+                    text = stringResource(R.string.benchmark_home_button),
+                    onClick = { nav.navigate(Routes.BENCHMARK) },
+                    leadingIcon = Icons.Filled.Speed,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 LsfgSecondaryButton(

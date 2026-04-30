@@ -20,6 +20,8 @@ import android.view.Display
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.lsfg.android.R
+import com.lsfg.android.benchmark.BenchmarkController
+import com.lsfg.android.benchmark.BenchmarkLogWriter
 import com.lsfg.android.prefs.CaptureSource
 import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.PacingDefaults
@@ -86,6 +88,10 @@ class LsfgForegroundService : Service() {
     private var shuttingDown: Boolean = false
     @Volatile
     private var pendingFpsCounter: Boolean = false
+    @Volatile
+    private var benchmarkRequested: Boolean = false
+    @Volatile
+    private var benchmarkStarted: Boolean = false
     private var pendingPrivilegedVideoStart: ShizukuVideoStart? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     // Display rotation listener — Service.onConfigurationChanged only fires
@@ -243,6 +249,8 @@ class LsfgForegroundService : Service() {
         }
         val targetPkg = intent.getStringExtra(EXTRA_TARGET_PACKAGE)
         val initialFpsCounter = intent.getBooleanExtra(EXTRA_FPS_COUNTER, false)
+        benchmarkRequested = intent.getBooleanExtra(EXTRA_BENCHMARK_REQUESTED, false)
+        benchmarkStarted = false
         if (usesMediaProjectionVideo && (data == null || resultCode == 0)) {
             LsfgLog.e(TAG, "Missing MediaProjection result intent; stopping")
             stopSelf()
@@ -420,6 +428,11 @@ class LsfgForegroundService : Service() {
                             pendingPrivilegedVideoStart = ShizukuVideoStart(w, h, cfg)
                         }
                         ov.updateStatus("LSFG: frame-gen active ${w}×${h} ×${cfg.multiplier}")
+                        // If the user launched this session via the Benchmark
+                        // screen, hand control to BenchmarkController now that
+                        // framegen has reached steady state. The controller runs
+                        // on its own thread; we resume normal service handling.
+                        maybeStartBenchmark()
                     }
                     rc > 0 -> {
                         LsfgLog.w(TAG, "initContext rc=$rc — framegen disabled, staying in mirror mode")
@@ -756,6 +769,62 @@ class LsfgForegroundService : Service() {
         }.start()
     }
 
+    /**
+     * Kicks the [BenchmarkController] off if this session was started with
+     * EXTRA_BENCHMARK_REQUESTED. Idempotent — flips [benchmarkStarted] so
+     * subsequent reinit completions don't re-trigger the controller.
+     */
+    private fun maybeStartBenchmark() {
+        if (!benchmarkRequested || benchmarkStarted) return
+        if (shuttingDown) return
+        benchmarkStarted = true
+        LsfgLog.i(TAG, "starting BenchmarkController")
+        BenchmarkController.start(applicationContext, object : BenchmarkController.Hooks {
+            override fun requestReinit() {
+                // Mirror the live-drawer code path so the controller doesn't
+                // need to know about reinit internals.
+                mainHandler.post { reinitLsfgContext() }
+            }
+            override fun activeRenderWidth(): Int = activeRenderW
+            override fun activeRenderHeight(): Int = activeRenderH
+            override fun targetPackage(): String? =
+                LsfgPreferences(this@LsfgForegroundService).load().targetPackage
+            override fun vsyncPeriodNs(): Long {
+                val hz = runCatching {
+                    val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+                    @Suppress("DEPRECATION")
+                    wm.defaultDisplay.refreshRate
+                }.getOrNull() ?: return 0L
+                if (hz <= 0f) return 0L
+                return (1_000_000_000.0 / hz).toLong()
+            }
+            override fun onCompleted(state: BenchmarkController.State.Completed) {
+                LsfgLog.i(TAG, "benchmark completed — report=${state.reportFile.absolutePath}")
+                // Stash the report file for the UI to pick up.
+                lastBenchmarkReport = state.reportFile
+                mainHandler.post {
+                    runCatching {
+                        val intent = BenchmarkLogWriter.buildShareIntent(
+                            this@LsfgForegroundService, state.reportFile,
+                        )
+                        val chooser = Intent.createChooser(
+                            intent, "Share LSFG benchmark report",
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(chooser)
+                    }.onFailure {
+                        LsfgLog.w(TAG, "failed to launch share chooser", it)
+                    }
+                    // The session is now done — tear it down.
+                    stopSelf()
+                }
+            }
+            override fun onFailed(state: BenchmarkController.State.Failed) {
+                LsfgLog.w(TAG, "benchmark failed: ${state.message}")
+                mainHandler.post { stopSelf() }
+            }
+        })
+    }
+
     private fun launchTarget(pkg: String) {
         LsfgLog.i(TAG, "launchTarget($pkg)")
         val launch = packageManager.getLaunchIntentForPackage(pkg)
@@ -858,6 +927,13 @@ class LsfgForegroundService : Service() {
         private const val CHANNEL_ID = "lsfg_session"
         private const val NOTIF_ID = 1001
 
+        /** Last benchmark report file produced by a benchmark session. The
+         *  Benchmark screen polls this so the user can re-share the file
+         *  after dismissing the system chooser. Set by the BenchmarkController
+         *  hook callback; cleared lazily by the UI when acknowledged. */
+        @Volatile
+        var lastBenchmarkReport: File? = null
+
         const val ACTION_START = "com.lsfg.android.action.START_SESSION"
         const val ACTION_STOP = "com.lsfg.android.action.STOP_SESSION"
         const val EXTRA_RESULT_CODE = "result_code"
@@ -865,6 +941,11 @@ class LsfgForegroundService : Service() {
         const val EXTRA_TARGET_PACKAGE = "target_package"
         const val EXTRA_FPS_COUNTER = "fps_counter"
         const val EXTRA_CAPTURE_SOURCE = "capture_source"
+        // When true, after framegen reaches steady state the service hands
+        // control to BenchmarkController which runs three back-to-back passes
+        // (multiplier x2/x3/x4) and produces a shareable report. The session
+        // is stopped automatically when the report is ready.
+        const val EXTRA_BENCHMARK_REQUESTED = "benchmark_requested"
 
         fun buildStartIntent(
             ctx: Context,
@@ -906,5 +987,23 @@ class LsfgForegroundService : Service() {
                 Intent(ctx, LsfgForegroundService::class.java).setAction(ACTION_STOP)
             )
         }
+
+        /** MediaProjection variant that flips on EXTRA_BENCHMARK_REQUESTED. The
+         *  caller still supplies a fresh consent token (resultCode/resultData)
+         *  exactly like the normal path. */
+        fun buildBenchmarkStartIntent(
+            ctx: Context,
+            resultCode: Int,
+            resultData: Intent,
+            targetPackage: String?,
+            captureSource: CaptureSource = CaptureSource.MEDIA_PROJECTION,
+        ): Intent = Intent(ctx, LsfgForegroundService::class.java)
+            .setAction(ACTION_START)
+            .putExtra(EXTRA_RESULT_CODE, resultCode)
+            .putExtra(EXTRA_RESULT_DATA, resultData)
+            .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
+            .putExtra(EXTRA_FPS_COUNTER, false)
+            .putExtra(EXTRA_CAPTURE_SOURCE, captureSource.prefValue)
+            .putExtra(EXTRA_BENCHMARK_REQUESTED, true)
     }
 }

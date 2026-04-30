@@ -198,4 +198,21 @@
     <string name="crash_dialog_view">View</string>
     <string name="crash_export_log">Export diagnostic log</string>
     <string name="crash_export_none">No diagnostic log available yet — run a session first.</string>
+
+    <!-- Benchmark mode -->
+    <string name="benchmark_title">Benchmark Mode</string>
+    <string name="benchmark_home_button">Run benchmark</string>
+    <string name="benchmark_intro">Runs three back-to-back passes (multiplier ×2, ×3, ×4) with a fixed preset and produces a shareable report. Use this baseline before/after performance changes to measure deltas.</string>
+    <string name="benchmark_preset_summary">Flow scale 0.70 · Performance mode ON · Anti-artifacts OFF · Post-processing OFF · Vsync AUTO</string>
+    <string name="benchmark_duration_summary">Each run: 60 seconds sampling + 2 seconds warmup. Total ~3 minutes plus target-app launch.</string>
+    <string name="benchmark_requires_target">Pick a target app first (in the Automatic Overlay screen).</string>
+    <string name="benchmark_start">Start benchmark</string>
+    <string name="benchmark_cancel">Cancel</string>
+    <string name="benchmark_share_report">Share last report</string>
+    <string name="benchmark_running_warmup">Warmup ×%1$d — %2$d s remaining</string>
+    <string name="benchmark_running_sampling">Run %1$d/%2$d — multiplier ×%3$d — %4$d s remaining</string>
+    <string name="benchmark_completed">Benchmark complete</string>
+    <string name="benchmark_completed_body">Report saved to %1$s. Use the share sheet to send it.</string>
+    <string name="benchmark_failed">Benchmark failed: %1$s</string>
+    <string name="benchmark_no_report">No report available yet — run a benchmark first.</string>
 </resources>

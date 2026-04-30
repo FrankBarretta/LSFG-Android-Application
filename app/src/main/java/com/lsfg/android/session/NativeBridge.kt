@@ -145,6 +145,17 @@ object NativeBridge {
     external fun getRecentPostIntervalsNs(outIntervalsNs: LongArray): Int
 
     /**
+     * Snapshot of the most recently completed profiling window from the native
+     * worker thread. `out` must have length >= 6; on success it's populated with
+     * `[copyNs, presentNs, waitIdleNs, blitNs, totalNs, samples]` (segment SUMS
+     * over the window — divide by samples for per-frame averages) and the call
+     * returns 6. Returns 0 when no window has closed yet (samples == 0). Used
+     * by the benchmark mode to surface frame-time profiling without scraping
+     * logcat.
+     */
+    external fun getProfileWindowNs(out: LongArray): Int
+
+    /**
      * Toggle frame-generation bypass. When true, the native render loop blits
      * the latest captured frame straight to the overlay surface and skips
      * framegen entirely — useful for A/B comparisons against the generated output.

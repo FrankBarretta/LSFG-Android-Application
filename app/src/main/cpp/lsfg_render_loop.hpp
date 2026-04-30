@@ -115,6 +115,15 @@ uint64_t getUniqueCaptureCount();
 // jitter instead of rolling counts.
 uint32_t getRecentPostIntervalsNs(int64_t *outIntervalsNs, uint32_t cap);
 
+// Snapshot of the most recently completed profiling window. `out` must be
+// at least 6 longs; on success populates [copyNs, presentNs, waitIdleNs,
+// blitNs, totalNs, samples] (each segment is the SUM over the window —
+// divide by samples for per-frame averages) and returns 6. Returns 0 when
+// no window has completed yet or `cap` < 6. The benchmark mode polls this
+// periodically to surface the same numbers shown in the per-window logcat
+// summary, without scraping logs.
+uint32_t getProfileWindowNs(int64_t *out, uint32_t cap);
+
 // Toggle frame-gen bypass. When true, the worker skips framegen entirely and
 // blits the latest captured frame straight to the output surface — useful for
 // A/B comparisons against the generated output. Safe to call from any thread.

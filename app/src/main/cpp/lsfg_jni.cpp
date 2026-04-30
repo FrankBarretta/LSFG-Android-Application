@@ -198,6 +198,21 @@ Java_com_lsfg_android_session_NativeBridge_getRecentPostIntervalsNs(
     return static_cast<jint>(written);
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_lsfg_android_session_NativeBridge_getProfileWindowNs(
+        JNIEnv *env, jobject /*thiz*/, jlongArray outArray) {
+    if (outArray == nullptr) return 0;
+    const jsize cap = env->GetArrayLength(outArray);
+    if (cap < 6) return 0;
+    jlong *buf = env->GetLongArrayElements(outArray, nullptr);
+    if (buf == nullptr) return 0;
+    static_assert(sizeof(jlong) == sizeof(int64_t), "jlong must be int64_t");
+    const uint32_t written = lsfg_android::getProfileWindowNs(
+        reinterpret_cast<int64_t *>(buf), static_cast<uint32_t>(cap));
+    env->ReleaseLongArrayElements(outArray, buf, 0);
+    return static_cast<jint>(written);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_lsfg_android_session_NativeBridge_setBypass(
         JNIEnv * /*env*/, jobject /*thiz*/, jboolean bypass) {
