@@ -268,12 +268,7 @@ class OverlayManager(private val ctx: Context) {
                 return true
             }
 
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
-                val n = ++surfaceTextureUpdateCount
-                if (n <= 30 || n % 60 == 0) {
-                    Log.d(TAG, "onSurfaceTextureUpdated #$n")
-                }
-            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
         }
         val fps = TextView(ctx).apply {
             text = ""

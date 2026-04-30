@@ -16,10 +16,6 @@ android {
         versionCode = 1
         versionName = "0.1.1"
 
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
-        }
-
         externalNativeBuild {
             cmake {
                 cppFlags += listOf(
@@ -80,11 +76,14 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            isDebuggable = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            isDebuggable = false
+            ndk {
+                debugSymbolLevel = "none"
+            }
             val relCfg = signingConfigs.getByName("release")
             signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
             // ThinLTO: cross-TU inlining between lsfg_render_loop.cpp, framegen,
@@ -102,9 +101,21 @@ android {
         }
     }
 
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
+        }
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 }
