@@ -12,10 +12,21 @@
 -keep interface rikka.shizuku.** { *; }
 -dontwarn rikka.shizuku.**
 
+# Shizuku spawns ShizukuCaptureUserService in a separate process and instantiates
+# it by class name via reflection (Class.forName(...).newInstance()). The class
+# name is also passed to bindUserService through ComponentName, which uses the
+# obfuscated name. Keep both the class and its no-arg constructor verbatim.
+-keep class com.lsfg.android.session.ShizukuCaptureUserService { *; }
+
 # libsu spawns a remote root process and resolves classes by name across the IPC boundary.
 -keep class com.topjohnwu.superuser.** { *; }
 -keep interface com.topjohnwu.superuser.** { *; }
 -dontwarn com.topjohnwu.superuser.**
+
+# RootCaptureService extends libsu's RootService and is instantiated by name in
+# the spawned root process. Same constraint as ShizukuCaptureUserService.
+-keep class com.lsfg.android.session.RootCaptureService { *; }
+-keep class com.lsfg.android.session.RootCaptureService$* { *; }
 
 # Parcelables / Binder stubs declared anywhere in the app.
 -keepclassmembers class * implements android.os.Parcelable {
