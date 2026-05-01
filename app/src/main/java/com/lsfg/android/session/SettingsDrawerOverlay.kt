@@ -40,6 +40,7 @@ import com.lsfg.android.prefs.OverlayMode
 import com.lsfg.android.prefs.PacingDefaults
 import com.lsfg.android.prefs.PacingPreset
 import com.lsfg.android.prefs.VsyncRefreshOverride
+import java.io.File
 
 /**
  * Right-edge settings drawer for the in-game overlay.
@@ -383,6 +384,26 @@ class SettingsDrawerOverlay(
             prefs.setAntiArtifacts(it)
             NativeBridge.setAntiArtifacts(it)
         })
+
+        // FP16 frame-gen shaders — only show when the GPU supports shaderFloat16
+        // and the FP16 SPIR-V cache has been populated (same gate the in-app
+        // Params screen uses). Toggling requires a context re-init because
+        // shader modules are bound at LSFG_3_X::initialize time, hence the
+        // liveParamsListener call.
+        val fp16CacheDir = File(ctx.filesDir, "spirv").absolutePath
+        val fp16Available = runCatching {
+            NativeBridge.isFramegenFp16Supported(fp16CacheDir)
+        }.getOrDefault(false)
+        if (fp16Available) {
+            frameGenSection.addView(switchRow(
+                label = "FP16 frame-gen shaders",
+                initial = initial.framegenFp16,
+            ) {
+                Log.i(TAG, "live: framegenFp16=$it")
+                prefs.setFramegenFp16(it)
+                liveParamsListener?.onParamsChanged()
+            })
+        }
 
         frameGenSection.addView(sectionSpacer(8))
 

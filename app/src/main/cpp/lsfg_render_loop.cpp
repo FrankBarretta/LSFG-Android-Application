@@ -46,6 +46,7 @@ struct State {
     bool initialized = false;
     bool performanceMode = false;
     bool framegenInitOk = false;  // tracks whether LSFG_3_1::initialize succeeded
+    bool framegenFp16 = false;    // load IDs 304..351 (FP16 SPIR-V) instead of 255..302 (DXBC->SPIR-V)
     bool hdr = false;
     float flowScale = 1.0f;
     int32_t framegenCtxId = -1;
@@ -1099,15 +1100,41 @@ bool processRealFrameIntoSlot(const AhbImage &src, const AhbImage &dst) {
 
 bool initFramegen(const char *cacheDir) {
     const std::string cache(cacheDir ? cacheDir : "");
-    auto loader = [cache](const std::string &name) -> std::vector<uint8_t> {
+    // Decide once, before the loader closure captures it: when the user asked
+    // for FP16 *and* the FP16 SPIR-V cache is fully populated, use it. If the
+    // cache is incomplete (older Lossless.dll, partial extraction failure)
+    // fall back to FP32 silently — this matches what the UI capability gate
+    // already advertises but covers the case where the DLL changed between
+    // toggle-on and session start.
+    const bool useFp16 = g.framegenFp16 && fp16_shaders_available(cache);
+    if (g.framegenFp16 && !useFp16) {
+        LOGW("FP16 framegen requested but SPIR-V FP16 cache is incomplete in %s — falling back to FP32",
+             cache.c_str());
+    }
+    if (useFp16) {
+        LOGI("Loading framegen shaders from FP16 SPIR-V cache (Lossless.dll resource IDs 304..351)");
+    }
+    auto loader = [cache, useFp16](const std::string &name) -> std::vector<uint8_t> {
         // Framegen requests shaders by symbolic name (e.g. "p_mipmaps");
-        // we cache them on disk by numeric resource ID (e.g. 255.spv).
-        const uint32_t id = shader_name_to_resource_id(name);
+        // we cache them on disk by numeric resource ID. The FP16 path uses a
+        // parallel set of precompiled SPIR-V variants (DXBC_id + 49) stored
+        // under <cache>/fp16/.
+        const uint32_t id = useFp16
+            ? shader_name_to_resource_id_fp16(name)
+            : shader_name_to_resource_id(name);
         if (id == 0) {
             LOGE("Unknown shader name '%s' from framegen", name.c_str());
             return {};
         }
-        auto spirv = load_cached_spirv(cache, id);
+        auto spirv = load_cached_spirv(cache, id, useFp16);
+        if (spirv.empty() && useFp16) {
+            // Per-shader fallback: a single missing FP16 blob shouldn't kill
+            // the session — fall back to the FP32 variant for this shader.
+            const uint32_t fp32Id = shader_name_to_resource_id(name);
+            LOGW("FP16 shader '%s' (id %u) missing — falling back to FP32 (id %u)",
+                 name.c_str(), id, fp32Id);
+            spirv = load_cached_spirv(cache, fp32Id, /*useFp16=*/false);
+        }
         if (spirv.empty()) {
             LOGE("Shader '%s' (id %u) missing from cache (%s)",
                  name.c_str(), id, cache.c_str());
@@ -1734,6 +1761,7 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     const int totalMult = cfg.multiplier > 1 ? cfg.multiplier : 2;
     g.multiplier = totalMult - 1;  // generationCount = N extra frames per pair
     g.performanceMode = cfg.performance;
+    g.framegenFp16 = cfg.framegenFp16;
     g.hdr = cfg.hdr;
     g.antiArtifacts.store(cfg.antiArtifacts, std::memory_order_relaxed);
     const bool requestedNpu = cfg.npuPostProcessing;

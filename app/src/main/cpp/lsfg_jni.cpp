@@ -73,7 +73,7 @@ Java_com_lsfg_android_session_NativeBridge_initContext(
         jstring cacheDir, jint width, jint height,
         jint multiplier, jfloat flowScale,
         jboolean performance, jboolean hdr,
-        jboolean antiArtifacts,
+        jboolean antiArtifacts, jboolean framegenFp16,
         jboolean npuPostProcessing, jint npuPreset,
         jint npuUpscaleFactor, jfloat npuAmount,
         jfloat npuRadius, jfloat npuThreshold, jboolean npuFp16,
@@ -106,6 +106,7 @@ Java_com_lsfg_android_session_NativeBridge_initContext(
         .performance = performance == JNI_TRUE,
         .hdr = hdr == JNI_TRUE,
         .antiArtifacts = antiArtifacts == JNI_TRUE,
+        .framegenFp16 = framegenFp16 == JNI_TRUE,
         .npuPostProcessing = npuPostProcessing == JNI_TRUE,
         .npuPreset = static_cast<int>(npuPreset),
         .npuUpscaleFactor = static_cast<int>(npuUpscaleFactor),
@@ -137,6 +138,26 @@ Java_com_lsfg_android_session_NativeBridge_initContext(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_lsfg_android_session_NativeBridge_isNpuAvailable(JNIEnv * /*env*/, jobject /*thiz*/) {
     return lsfg_android::nnapi_has_npu_accelerator() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_lsfg_android_session_NativeBridge_isFramegenFp16Supported(
+        JNIEnv *env, jobject /*thiz*/, jstring cacheDir) {
+    // Two prerequisites: the GPU has to expose shaderFloat16, AND the FP16
+    // SPIR-V cache must already be populated by the DLL extraction step.
+    // The UI ANDs them so the toggle appears only when the user can actually
+    // enable it without surprises.
+    if (!lsfg_android::device_supports_float16()) {
+        return JNI_FALSE;
+    }
+    if (cacheDir == nullptr) {
+        return JNI_FALSE;
+    }
+    const std::string cache = jstring_to_std(env, cacheDir);
+    if (cache.empty()) {
+        return JNI_FALSE;
+    }
+    return lsfg_android::fp16_shaders_available(cache) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL

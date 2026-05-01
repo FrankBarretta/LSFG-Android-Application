@@ -80,6 +80,14 @@ fun ParamsFrameGenPacingScreen(nav: NavHostController) {
     val ctx = LocalContext.current
     val prefs = remember { LsfgPreferences(ctx) }
     val state by produceConfigState(prefs).collectAsState()
+    // The FP16 toggle is only meaningful when (a) the GPU advertises shaderFloat16
+    // and (b) the FP16 SPIR-V cache from Lossless.dll has been populated. The
+    // native probe ANDs both. Cached for the screen's lifetime — recomputed on
+    // re-entry, which covers the post-DLL-pick / post-extract case naturally.
+    val fp16Available = remember {
+        val cacheDir = java.io.File(ctx.filesDir, "spirv").absolutePath
+        runCatching { NativeBridge.isFramegenFp16Supported(cacheDir) }.getOrDefault(false)
+    }
 
     Column(
         modifier = Modifier
@@ -175,6 +183,19 @@ fun ParamsFrameGenPacingScreen(nav: NavHostController) {
                     refreshConfigState(prefs)
                 },
             )
+            if (fp16Available) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ToggleRow(
+                    icon = Icons.Filled.Memory,
+                    title = stringResource(R.string.param_framegen_fp16),
+                    description = stringResource(R.string.param_framegen_fp16_desc),
+                    checked = state.framegenFp16,
+                    onCheckedChange = {
+                        prefs.setFramegenFp16(it)
+                        refreshConfigState(prefs)
+                    },
+                )
+            }
         }
 
         // ---- Pacing -----------------------------------------------------------------

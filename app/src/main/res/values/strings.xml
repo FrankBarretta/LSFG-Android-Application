@@ -92,6 +92,8 @@
     <string name="param_hdr_desc">Enable only if your device and game output HDR.</string>
     <string name="param_anti_artifacts">Anti-artifacts Mode</string>
     <string name="param_anti_artifacts_desc">Suppress generated frames during very fast camera movement to reduce missing character parts and warping. Off by default.</string>
+    <string name="param_framegen_fp16">FP16 frame-gen shaders</string>
+    <string name="param_framegen_fp16_desc">Use the half-precision shader variants pre-compiled inside Lossless.dll instead of the full-precision DXBC set. Reduces GPU load and memory bandwidth. Quality is virtually identical; falls back to FP32 automatically if anything goes wrong.</string>
     <string name="param_npu_post">NPU image enhancement</string>
     <string name="param_npu_post_desc_available">Runs a handcrafted NNAPI graph (unsharp-mask, detail boost, chroma clean, game crisp) entirely on the dedicated accelerator. Device: %1$s</string>
     <string name="param_npu_post_desc_unavailable">Disabled because Android does not report a dedicated NNAPI accelerator. Device: %1$s</string>
@@ -205,6 +207,7 @@
     <string name="benchmark_intro">Runs three back-to-back passes (multiplier ×2, ×3, ×4) with a fixed preset and produces a shareable report. Use this baseline before/after performance changes to measure deltas.</string>
     <string name="benchmark_preset_summary">Flow scale 0.70 · Performance mode ON · Anti-artifacts OFF · Post-processing OFF · Vsync AUTO</string>
     <string name="benchmark_duration_summary">Each run: 60 seconds sampling + 2 seconds warmup. Total ~3 minutes plus target-app launch.</string>
+    <string name="benchmark_dual_precision_summary">FP16 supported on this GPU — the benchmark will run twice (FP32 then FP16) for direct side-by-side numbers in the same report.</string>
     <string name="benchmark_requires_target">Pick a target app first (in the Automatic Overlay screen).</string>
     <string name="benchmark_start">Start benchmark</string>
     <string name="benchmark_cancel">Cancel</string>

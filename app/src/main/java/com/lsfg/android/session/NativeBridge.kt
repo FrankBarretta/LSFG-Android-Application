@@ -65,6 +65,7 @@ object NativeBridge {
         performance: Boolean,
         hdr: Boolean,
         antiArtifacts: Boolean,
+        framegenFp16: Boolean,
         npuPostProcessing: Boolean,
         npuPreset: Int,
         npuUpscaleFactor: Int,
@@ -93,6 +94,20 @@ object NativeBridge {
 
     /** True only when NNAPI reports a dedicated accelerator device, not CPU/GPU fallback. */
     external fun isNpuAvailable(): Boolean
+
+    /**
+     * Reports whether the FP16 frame-generation shader path is usable on this
+     * device. Two prerequisites must both hold:
+     *  - The Vulkan driver advertises VK_KHR_shader_float16_int8 with
+     *    `shaderFloat16=VK_TRUE`.
+     *  - The DLL extraction step has populated `<cacheDir>/fp16/` with the
+     *    49 SPIR-V FP16 shader variants from Lossless.dll resource IDs 304..351.
+     *
+     * The UI uses this to grey out the "FP16 frame-gen shaders" toggle on
+     * unsupported hardware or before the user has picked a DLL. Cheap to
+     * call (single VkInstance create + feature query, no device created).
+     */
+    external fun isFramegenFp16Supported(cacheDir: String): Boolean
 
     /** Human-readable NNAPI accelerator list for diagnostics and settings copy. */
     external fun getNpuSummary(): String

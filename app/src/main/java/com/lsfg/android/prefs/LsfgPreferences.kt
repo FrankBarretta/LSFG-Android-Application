@@ -13,6 +13,15 @@ data class LsfgConfig(
     val performanceMode: Boolean,
     val hdrMode: Boolean,
     val antiArtifacts: Boolean,
+    /**
+     * When true, the render loop loads the precompiled SPIR-V FP16 shader
+     * variants from Lossless.dll (resource IDs 304..351) instead of
+     * translating the DXBC FP32 set (255..302) via dxvk. Requires
+     * `VK_KHR_shader_float16_int8` + `shaderFloat16` on the GPU. The UI
+     * gates this via [NativeBridge.isFramegenFp16Supported] so unsupported
+     * hardware never sees the toggle.
+     */
+    val framegenFp16: Boolean,
     val targetPackage: String?,
     val captureSource: CaptureSource,
     val legalAccepted: Boolean,
@@ -223,6 +232,7 @@ class LsfgPreferences(ctx: Context) {
         performanceMode = prefs.getBoolean(KEY_PERF, true),
         hdrMode = prefs.getBoolean(KEY_HDR, false),
         antiArtifacts = prefs.getBoolean(KEY_ANTI_ARTIFACTS, false),
+        framegenFp16 = prefs.getBoolean(KEY_FRAMEGEN_FP16, false),
         targetPackage = prefs.getString(KEY_TARGET, null),
         captureSource = CaptureSource.fromPref(prefs.getString(KEY_CAPTURE_SOURCE, null)),
         legalAccepted = prefs.getBoolean(KEY_LEGAL, false),
@@ -286,6 +296,7 @@ class LsfgPreferences(ctx: Context) {
     fun setPerformance(value: Boolean) = prefs.edit().putBoolean(KEY_PERF, value).apply()
     fun setHdr(value: Boolean) = prefs.edit().putBoolean(KEY_HDR, value).apply()
     fun setAntiArtifacts(value: Boolean) = prefs.edit().putBoolean(KEY_ANTI_ARTIFACTS, value).apply()
+    fun setFramegenFp16(value: Boolean) = prefs.edit().putBoolean(KEY_FRAMEGEN_FP16, value).apply()
     fun setTargetPackage(pkg: String?) = prefs.edit().putString(KEY_TARGET, pkg).apply()
     fun setCaptureSource(value: CaptureSource) = prefs.edit()
         .putString(KEY_CAPTURE_SOURCE, value.prefValue)
@@ -362,6 +373,7 @@ class LsfgPreferences(ctx: Context) {
         private const val KEY_PERF = "performance"
         private const val KEY_HDR = "hdr"
         private const val KEY_ANTI_ARTIFACTS = "anti_artifacts"
+        private const val KEY_FRAMEGEN_FP16 = "framegen_fp16"
         private const val KEY_TARGET = "target_pkg"
         private const val KEY_CAPTURE_SOURCE = "capture_source"
         private const val KEY_LEGAL = "legal_accepted"

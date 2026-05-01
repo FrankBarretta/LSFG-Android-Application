@@ -25,6 +25,10 @@ data class BenchmarkRunResult(
     val multiplier: Int,
     val flowScale: Float,
     val performanceMode: Boolean,
+    /** Which shader-precision path produced this result. The benchmark runs
+     *  every multiplier twice on FP16-capable devices so the report can show
+     *  FP32 vs FP16 numbers side by side. False on devices without FP16. */
+    val framegenFp16: Boolean,
     val runDurationMs: Long,
     val totalUniqueCaptures: Long,
     val totalGeneratedFrames: Long,

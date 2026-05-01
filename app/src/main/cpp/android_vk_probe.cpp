@@ -177,4 +177,64 @@ int probe_shaders_on_device(const std::string &cacheDir) {
     return rejected == 0 ? kOk : kProbeDriverRejected;
 }
 
+bool device_supports_float16() {
+    // Minimal headless instance just to query a physical-device feature. We
+    // intentionally do NOT request the FP16 device extension during creation
+    // because we want a yes/no answer for the UI, not a working device. A
+    // separate VkInstance is fine — the cost is one volkInitialize and one
+    // vkEnumeratePhysicalDevices, both well under a frame.
+    if (volkInitialize() != VK_SUCCESS) {
+        return false;
+    }
+    const VkApplicationInfo appInfo{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "lsfg-android",
+        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+        .pEngineName = "lsfg-vk",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_1,
+    };
+    const VkInstanceCreateInfo instInfo{
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &appInfo,
+    };
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&instInfo, nullptr, &instance) != VK_SUCCESS) {
+        return false;
+    }
+    volkLoadInstance(instance);
+
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (count == 0) {
+        vkDestroyInstance(instance, nullptr);
+        return false;
+    }
+    std::vector<VkPhysicalDevice> phys(count);
+    vkEnumeratePhysicalDevices(instance, &count, phys.data());
+
+    bool ok = false;
+    VkPhysicalDeviceShaderFloat16Int8Features fp16{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    };
+    VkPhysicalDeviceFeatures2 feats2{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &fp16,
+    };
+    // Walk every physical device — the FP16 toggle should be available if ANY
+    // of the device's GPUs supports it (the framegen session picks the first
+    // compute-capable one in the same order in create_instance_and_device).
+    for (auto pd : phys) {
+        fp16.shaderFloat16 = VK_FALSE;
+        fp16.shaderInt8 = VK_FALSE;
+        vkGetPhysicalDeviceFeatures2(pd, &feats2);
+        if (fp16.shaderFloat16 == VK_TRUE) {
+            ok = true;
+            break;
+        }
+    }
+    vkDestroyInstance(instance, nullptr);
+    return ok;
+}
+
 } // namespace lsfg_android

@@ -387,6 +387,7 @@ class LsfgForegroundService : Service() {
                         performance = cfg.performanceMode,
                         hdr = cfg.hdrMode,
                         antiArtifacts = cfg.antiArtifacts,
+                        framegenFp16 = cfg.framegenFp16,
                         npuPostProcessing = cfg.npuPostProcessingEnabled,
                         npuPreset = cfg.npuPostProcessingPreset.nativeValue,
                         npuUpscaleFactor = cfg.npuUpscaleFactor,
@@ -688,6 +689,7 @@ class LsfgForegroundService : Service() {
                         performance = cfg.performanceMode,
                         hdr = cfg.hdrMode,
                         antiArtifacts = cfg.antiArtifacts,
+                        framegenFp16 = cfg.framegenFp16,
                         npuPostProcessing = cfg.npuPostProcessingEnabled,
                         npuPreset = cfg.npuPostProcessingPreset.nativeValue,
                         npuUpscaleFactor = cfg.npuUpscaleFactor,
@@ -1004,6 +1006,32 @@ class LsfgForegroundService : Service() {
             .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
             .putExtra(EXTRA_FPS_COUNTER, false)
             .putExtra(EXTRA_CAPTURE_SOURCE, captureSource.prefValue)
+            .putExtra(EXTRA_BENCHMARK_REQUESTED, true)
+
+        /** Shizuku-capture variant of the benchmark intent. No MediaProjection
+         *  consent token is required — the privileged side channel handles
+         *  capture without the system recording dialog. */
+        fun buildShizukuBenchmarkStartIntent(
+            ctx: Context,
+            targetPackage: String?,
+        ): Intent = Intent(ctx, LsfgForegroundService::class.java)
+            .setAction(ACTION_START)
+            .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
+            .putExtra(EXTRA_FPS_COUNTER, false)
+            .putExtra(EXTRA_CAPTURE_SOURCE, CaptureSource.SHIZUKU.prefValue)
+            .putExtra(EXTRA_BENCHMARK_REQUESTED, true)
+
+        /** Root-capture variant. Same shape as the Shizuku variant — no
+         *  consent intent, capture happens through the rooted privileged
+         *  pipeline. */
+        fun buildRootBenchmarkStartIntent(
+            ctx: Context,
+            targetPackage: String?,
+        ): Intent = Intent(ctx, LsfgForegroundService::class.java)
+            .setAction(ACTION_START)
+            .putExtra(EXTRA_TARGET_PACKAGE, targetPackage)
+            .putExtra(EXTRA_FPS_COUNTER, false)
+            .putExtra(EXTRA_CAPTURE_SOURCE, CaptureSource.ROOT.prefValue)
             .putExtra(EXTRA_BENCHMARK_REQUESTED, true)
     }
 }

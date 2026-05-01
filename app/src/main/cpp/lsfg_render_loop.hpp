@@ -43,6 +43,14 @@ struct RenderLoopConfig {
     bool performance;     // selects LSFG_3_1P vs LSFG_3_1
     bool hdr;
     bool antiArtifacts;
+    // Use the precompiled SPIR-V FP16 shader variants (Lossless.dll resource
+    // IDs 304..351) instead of the DXBC-translated FP32 set (255..302). The
+    // FP16 variants enable OpCapability Float16 and use mixed FP16/FP32 ops.
+    // Requires the GPU to support VK_KHR_shader_float16_int8 + shaderFloat16,
+    // and requires the FP16 SPIR-V cache to have been populated by the DLL
+    // extraction step. The render loop transparently falls back to the FP32
+    // path when either prerequisite is missing.
+    bool framegenFp16;
     bool npuPostProcessing;
     int npuPreset;        // see NpuPreset: 0 off, 1 sharpen, 2 detail boost, 3 chroma clean, 4 game crisp
     int npuUpscaleFactor; // 1 or 2

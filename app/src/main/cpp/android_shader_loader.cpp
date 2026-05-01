@@ -18,10 +18,12 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -41,6 +43,18 @@ constexpr uint32_t kResourceIds[] = {
     280, 281, 282, 283, 284, 285, 286, 287, 288, 289,
     290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301, 302,
 };
+
+// FP16 SPIR-V variants live as RCDATA at DXBC_id + 49 (range 304..351).
+// They're already SPIR-V — no DXBC translation needed. The blob has
+// OpCapability Float16 and mixed FP16/FP32 OpTypeFloat. See
+// patches/LosslessScaling/findings.md for the full mapping table.
+constexpr uint32_t kFp16IdOffset = 49;
+
+// SPIR-V LE magic word (0x07230203). Used to validate FP16 blobs before
+// caching them — if THS reshuffles resource layout in a future Lossless.dll
+// update, IDs 304..351 may stop being SPIR-V; we silently skip those instead
+// of caching garbage.
+constexpr std::array<uint8_t, 4> kSpirvMagic{0x03, 0x02, 0x23, 0x07};
 
 struct ExtractionCtx {
     std::unordered_map<uint32_t, std::vector<uint8_t>> *out;
@@ -63,6 +77,166 @@ struct BindingOffsets {
     uint32_t setIndex{};
     uint32_t setOffset{};
 };
+
+// Renumber Binding decorations to match the descriptor layout expected by the
+// framegen library (lsfg-vk-android).
+//
+// The framework builds its VkDescriptorSetLayout by counting bindings from 0
+// in a *type-grouped* order: first uniform buffers, then samplers, then
+// sampled images, then storage images. See e.g.
+// `framegen/v3.1p_src/shaders/mipmaps.cpp:19-23` which declares
+//   { 1, UNIFORM_BUFFER }, { 1, SAMPLER }, { 1, SAMPLED_IMAGE }, { 7, STORAGE_IMAGE }
+// and ShaderModule fills `binding = 0..N-1` over that flattened sequence.
+//
+// The DXBC→SPIR-V translator path (translate_dxbc_to_spirv) gets this for
+// free because DXVK happens to emit OpDecorate Binding decorations in the
+// matching order. The FP16 path consumes precompiled SPIR-V straight from
+// Lossless.dll where the bindings are HLSL register slots and the
+// OpDecorate ordering is `sampler, sampled_image, storage_image..., cb`
+// (cb last) — flattened in declaration order this puts the uniform buffer
+// at slot 9 instead of 0, mismatching the layout and producing the symptoms
+// the user reported (black flashes alternating with valid frames, top-left
+// black rectangle that grows with flowScale).
+//
+// The fix: classify each variable by its underlying type kind, then assign
+// dense bindings in the framework's expected group order, breaking ties by
+// the variable's original binding number so the relative order within a
+// group (e.g. Output0..Output6) is preserved.
+//
+// Returns true on success. Returns false on an unrecognised SPIR-V header
+// or malformed module so the extractor can skip the blob without corrupting
+// the cache.
+bool rewrite_spirv_bindings_dense(std::vector<uint8_t> &spirv) {
+    if (spirv.size() < 20 || (spirv.size() % 4) != 0) {
+        return false;
+    }
+    auto *words = reinterpret_cast<uint32_t *>(spirv.data());
+    const size_t wordCount = spirv.size() / 4;
+    if (words[0] != 0x07230203u) {
+        return false;
+    }
+
+    // SPIR-V opcodes / decorations we care about.
+    constexpr uint32_t kOpName = 5;
+    constexpr uint32_t kOpTypeImage = 25;
+    constexpr uint32_t kOpTypeSampler = 26;
+    constexpr uint32_t kOpTypeSampledImage = 27;
+    constexpr uint32_t kOpTypeStruct = 30;
+    constexpr uint32_t kOpTypePointer = 32;
+    constexpr uint32_t kOpVariable = 59;
+    constexpr uint32_t kOpDecorate = 71;
+    constexpr uint32_t kOpFunction = 54;
+    constexpr uint32_t kDecorationBinding = 33;
+
+    // Kind ordering matches the descriptor type order the framework emits at
+    // ShaderModule build time. Lower number = earlier in the layout.
+    enum Kind : int {
+        KindUnknown = 4,
+        KindUniformBuffer = 0,
+        KindSampler = 1,
+        KindSampledImage = 2,
+        KindStorageImage = 3,
+    };
+
+    struct BindingSite {
+        size_t valueWordIndex;
+        uint32_t varId;
+        uint32_t origBinding;
+        Kind kind;
+    };
+
+    // First pass: gather type info, variable->pointer mapping, and binding
+    // sites. Stop at OpFunction — bindings only appear in the declaration
+    // section before any function bodies.
+    std::unordered_map<uint32_t, Kind> typeKind;            // type id -> Kind
+    std::unordered_map<uint32_t, uint32_t> ptrPointee;       // pointer type id -> pointee type id
+    std::unordered_map<uint32_t, uint32_t> varType;          // var id -> pointer type id
+    std::vector<BindingSite> sites;
+    sites.reserve(32);
+
+    size_t i = 5; // skip 5-word SPIR-V header
+    while (i < wordCount) {
+        const uint32_t header = words[i];
+        const uint32_t wc = (header >> 16) & 0xFFFFu;
+        const uint32_t op = header & 0xFFFFu;
+        if (wc == 0 || i + wc > wordCount) {
+            return false; // malformed
+        }
+        if (op == kOpFunction) {
+            break;
+        }
+        switch (op) {
+            case kOpTypeSampler:
+                if (wc >= 2) typeKind[words[i + 1]] = KindSampler;
+                break;
+            case kOpTypeImage:
+                if (wc >= 8) {
+                    // OpTypeImage: id, sampledType, dim, depth, arrayed, ms, sampled, format
+                    // sampled == 1: sampled image (read-only); sampled == 2: storage image (read/write)
+                    typeKind[words[i + 1]] = (words[i + 7] == 2) ? KindStorageImage : KindSampledImage;
+                }
+                break;
+            case kOpTypeSampledImage:
+                if (wc >= 2) typeKind[words[i + 1]] = KindSampledImage;
+                break;
+            case kOpTypeStruct:
+                // We assume any struct backing a binding is a uniform buffer.
+                // The CB layout in Lossless.dll is consistent (verified
+                // statically across all FP16/FP32 variants).
+                if (wc >= 2) typeKind[words[i + 1]] = KindUniformBuffer;
+                break;
+            case kOpTypePointer:
+                // OpTypePointer: id, storageClass, type
+                if (wc == 4) ptrPointee[words[i + 1]] = words[i + 3];
+                break;
+            case kOpVariable:
+                // OpVariable: resultType (pointer), resultId, storageClass, [initializer]
+                if (wc >= 4) varType[words[i + 2]] = words[i + 1];
+                break;
+            case kOpDecorate:
+                if (wc == 4 && words[i + 2] == kDecorationBinding) {
+                    sites.push_back({i + 3, words[i + 1], words[i + 3], KindUnknown});
+                }
+                break;
+            default:
+                break;
+        }
+        i += wc;
+    }
+
+    // Resolve each binding site's kind via varId -> pointer -> pointee type.
+    for (auto &s : sites) {
+        const auto vt = varType.find(s.varId);
+        if (vt == varType.end()) continue;
+        const auto pp = ptrPointee.find(vt->second);
+        if (pp == ptrPointee.end()) continue;
+        const auto tk = typeKind.find(pp->second);
+        if (tk != typeKind.end()) {
+            s.kind = tk->second;
+        }
+    }
+
+    // Sort by (kind, original binding) so the framework's flat sequence
+    //   [uniform, sampler, sampled, storage_image_0..N-1]
+    // lines up. Stable sort to preserve input order for any ties (none
+    // expected, but defensive). Returns false if any site stayed unknown:
+    // that means we couldn't classify it, and renumbering would silently
+    // misroute the shader — better to skip the blob entirely.
+    for (const auto &s : sites) {
+        if (s.kind == KindUnknown) {
+            return false;
+        }
+    }
+    std::stable_sort(sites.begin(), sites.end(), [](const BindingSite &a, const BindingSite &b) {
+        if (a.kind != b.kind) return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+        return a.origBinding < b.origBinding;
+    });
+
+    for (size_t k = 0; k < sites.size(); ++k) {
+        words[sites[k].valueWordIndex] = static_cast<uint32_t>(k);
+    }
+    return true;
+}
 
 std::vector<uint8_t> translate_dxbc_to_spirv(const std::vector<uint8_t> &bytecode) {
     dxvk::DxbcReader reader(reinterpret_cast<const char *>(bytecode.data()), bytecode.size());
@@ -130,29 +304,22 @@ int extract_dll_to_spirv(const std::string &dllPath, const std::string &cacheDir
         return kErrDllUnreadable;
     }
 
-    std::unordered_map<uint32_t, std::vector<uint8_t>> dxbcByResId;
-    ExtractionCtx ctx{&dxbcByResId};
+    std::unordered_map<uint32_t, std::vector<uint8_t>> blobsByResId;
+    ExtractionCtx ctx{&blobsByResId};
     peparse::IterRsrc(dll, on_resource, &ctx);
     peparse::DestructParsedPE(dll);
 
-    // Ensure every resource ID we care about was present in the DLL.
+    // Ensure every DXBC resource we depend on is present.
     for (uint32_t id : kResourceIds) {
-        if (dxbcByResId.find(id) == dxbcByResId.end()) {
+        if (blobsByResId.find(id) == blobsByResId.end()) {
             LOGE("Missing resource id %u — is Lossless Scaling up to date?", id);
             return kErrMissingResource;
         }
     }
 
     int translated = 0;
-    for (const auto &[resId, dxbc] : dxbcByResId) {
-        // We only translate the ones we know belong to LSFG. Any other RCDATA
-        // in the DLL (e.g. version strings) would fail DXBC parsing.
-        const bool known =
-            std::find(std::begin(kResourceIds), std::end(kResourceIds), resId) != std::end(kResourceIds);
-        if (!known) {
-            continue;
-        }
-
+    for (uint32_t resId : kResourceIds) {
+        const auto &dxbc = blobsByResId.at(resId);
         std::vector<uint8_t> spirv;
         try {
             spirv = translate_dxbc_to_spirv(dxbc);
@@ -174,13 +341,63 @@ int extract_dll_to_spirv(const std::string &dllPath, const std::string &cacheDir
         ++translated;
     }
 
-    LOGI("Translated %d shaders into %s", translated, cacheDir.c_str());
+    LOGI("Translated %d DXBC shaders into %s", translated, cacheDir.c_str());
+
+    // FP16 SPIR-V variants: precompiled in the DLL at DXBC_id + 49. Cache them
+    // verbatim into <cacheDir>/fp16/. This is best-effort — a Lossless.dll
+    // build that doesn't ship the FP16 set must still produce a working FP32
+    // cache. Validation: the blob must start with the SPIR-V LE magic.
+    const std::string fp16Dir = cacheDir + "/fp16";
+    if (mkdir(fp16Dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        LOGE("Failed to create FP16 cache dir %s (errno=%d) — FP16 path disabled", fp16Dir.c_str(), errno);
+        return kOk; // FP32 already succeeded; degrade gracefully.
+    }
+    int fp16Cached = 0;
+    int fp16Skipped = 0;
+    for (uint32_t dxbcId : kResourceIds) {
+        const uint32_t fp16Id = dxbcId + kFp16IdOffset;
+        const auto it = blobsByResId.find(fp16Id);
+        if (it == blobsByResId.end()) {
+            ++fp16Skipped;
+            continue;
+        }
+        // Copy out so we can rewrite Binding decorations to the dense layout
+        // the framegen library expects. The FP16 SPIR-V blobs ship with HLSL
+        // register slots (t16/s32/u48/b0...) which must be flattened to
+        // 0,1,2,... in declaration order — same transformation the DXBC path
+        // performs via DXVK's code-stream rewriter.
+        std::vector<uint8_t> blob = it->second;
+        if (blob.size() < kSpirvMagic.size() ||
+            !std::equal(kSpirvMagic.begin(), kSpirvMagic.end(), blob.begin())) {
+            ++fp16Skipped;
+            continue;
+        }
+        if (!rewrite_spirv_bindings_dense(blob)) {
+            LOGE("FP16 SPIR-V binding rewrite failed for resource %u — skipping", fp16Id);
+            ++fp16Skipped;
+            continue;
+        }
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%u.spv", fp16Dir.c_str(), fp16Id);
+        if (!write_file(path, blob)) {
+            LOGE("Failed to write FP16 cache %s — FP16 path may be incomplete", path);
+            ++fp16Skipped;
+            continue;
+        }
+        ++fp16Cached;
+    }
+    LOGI("FP16 SPIR-V variants: %d cached, %d skipped (%s)", fp16Cached, fp16Skipped, fp16Dir.c_str());
     return kOk;
 }
 
-std::vector<uint8_t> load_cached_spirv(const std::string &cacheDir, uint32_t resId) {
+std::vector<uint8_t> load_cached_spirv(const std::string &cacheDir, uint32_t resId,
+                                       bool useFp16) {
     char path[512];
-    std::snprintf(path, sizeof(path), "%s/%u.spv", cacheDir.c_str(), resId);
+    if (useFp16) {
+        std::snprintf(path, sizeof(path), "%s/fp16/%u.spv", cacheDir.c_str(), resId);
+    } else {
+        std::snprintf(path, sizeof(path), "%s/%u.spv", cacheDir.c_str(), resId);
+    }
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         return {};
@@ -252,6 +469,40 @@ uint32_t shader_name_to_resource_id(const std::string &name) {
     };
     auto it = kTable.find(name);
     return it == kTable.end() ? 0u : it->second;
+}
+
+uint32_t shader_name_to_resource_id_fp16(const std::string &name) {
+    const uint32_t dxbcId = shader_name_to_resource_id(name);
+    if (dxbcId == 0) {
+        return 0;
+    }
+    const uint32_t fp16Id = dxbcId + kFp16IdOffset;
+    // Guard against accidentally walking off the FP16 SPIR-V range. Anything
+    // outside 304..351 means the DXBC id is out of the LSFG framegen set
+    // (shouldn't happen because shader_name_to_resource_id only returns
+    // 255..302), or the DLL layout has changed in a future release.
+    if (fp16Id < 304 || fp16Id > 351) {
+        return 0;
+    }
+    return fp16Id;
+}
+
+bool fp16_shaders_available(const std::string &cacheDir) {
+    // Quick existence check — the loader callback handles missing-file fallback
+    // per-shader, but we want a single boolean for the UI capability gate
+    // (so the FP16 toggle can grey out when the DLL didn't ship the FP16 set
+    // or when extraction skipped them).
+    for (uint32_t dxbcId : kResourceIds) {
+        const uint32_t fp16Id = dxbcId + kFp16IdOffset;
+        if (fp16Id < 304 || fp16Id > 351) continue;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/fp16/%u.spv", cacheDir.c_str(), fp16Id);
+        struct stat st{};
+        if (stat(path, &st) != 0 || st.st_size < 20) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace lsfg_android

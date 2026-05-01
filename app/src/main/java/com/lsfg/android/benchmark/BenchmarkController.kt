@@ -8,6 +8,7 @@ import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.NpuPostProcessingPreset
 import com.lsfg.android.prefs.CpuPostProcessingPreset
 import com.lsfg.android.prefs.VsyncRefreshOverride
+import com.lsfg.android.session.NativeBridge
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -36,9 +37,13 @@ object BenchmarkController {
     sealed class State {
         data object Idle : State()
         data class Running(
-            val runIndex: Int,            // 0-based: 0 = first run (×2)
-            val totalRuns: Int,
+            val runIndex: Int,            // 0-based, monotonic across all (precision, multiplier) pairs
+            val totalRuns: Int,           // multiplier_count × precision_count
             val multiplier: Int,
+            /** Which shader-precision pass this run belongs to. UI uses it to
+             *  show e.g. "Run 4/6 — FP16 ×3". Defaults to FP32 on devices
+             *  without FP16 support so the UI label is still meaningful. */
+            val precision: PrecisionMode,
             val phase: Phase,
             val phaseStartedAtMs: Long,
             val phaseDurationMs: Long,
@@ -135,6 +140,7 @@ object BenchmarkController {
         val savedFlowScale = originalConfig.flowScale
         val savedPerformance = originalConfig.performanceMode
         val savedAntiArtifacts = originalConfig.antiArtifacts
+        val savedFramegenFp16 = originalConfig.framegenFp16
         val savedNpuEnabled = originalConfig.npuPostProcessingEnabled
         val savedNpuPreset = originalConfig.npuPostProcessingPreset
         val savedCpuEnabled = originalConfig.cpuPostProcessingEnabled
@@ -142,8 +148,21 @@ object BenchmarkController {
         val savedGpuEnabled = originalConfig.gpuPostProcessingEnabled
         val savedVsyncOverride = originalConfig.vsyncRefreshOverride
 
+        // Decide up-front which precision modes are exercisable on this device.
+        // FP16 needs both shaderFloat16 on the GPU and a populated FP16 SPIR-V
+        // cache. The probe is the same one the UI uses to gate its toggle.
+        val cacheDir = File(ctx.filesDir, "spirv").absolutePath
+        val fp16Supported = runCatching {
+            NativeBridge.isFramegenFp16Supported(cacheDir)
+        }.getOrDefault(false)
+        val precisionModes: List<PrecisionMode> = BenchmarkConfig.PRECISION_MODES
+            .filter { it != PrecisionMode.FP16 || fp16Supported }
+        Log.i(TAG, "precision modes for this run: ${precisionModes.joinToString { it.label }} " +
+            "(fp16Supported=$fp16Supported)")
+
         try {
-            // Apply the fixed benchmark preset (everything except multiplier).
+            // Apply the fixed benchmark preset (everything except multiplier
+            // and the per-pass framegenFp16 flag).
             prefs.setFlowScale(BenchmarkConfig.FLOW_SCALE)
             prefs.setPerformance(BenchmarkConfig.PERFORMANCE_MODE)
             prefs.setAntiArtifacts(false)
@@ -159,49 +178,63 @@ object BenchmarkController {
             // benchmark route is on screen (see BenchmarkScreen).
             prefs.setVsyncRefreshOverride(VsyncRefreshOverride.AUTO)
 
-            val results = ArrayList<BenchmarkRunResult>(BenchmarkConfig.MULTIPLIERS.size)
+            val totalRuns = precisionModes.size * BenchmarkConfig.MULTIPLIERS.size
+            val results = ArrayList<BenchmarkRunResult>(totalRuns)
             val benchmarkStartMs = System.currentTimeMillis()
+            var globalIdx = 0
 
-            for ((idx, mult) in BenchmarkConfig.MULTIPLIERS.withIndex()) {
-                if (cancelRequested) {
-                    val cancelState = State.Failed("Cancelled by user during run ${idx + 1}")
-                    state.set(cancelState)
-                    postToMain { hooks.onFailed(cancelState) }
-                    return
-                }
-                Log.i(TAG, "starting run ${idx + 1}/${BenchmarkConfig.MULTIPLIERS.size} multiplier=$mult")
-                prefs.setMultiplier(mult)
-                hooks.requestReinit()
-
-                publishRunning(
-                    runIndex = idx,
-                    totalRuns = BenchmarkConfig.MULTIPLIERS.size,
-                    multiplier = mult,
-                    phase = Phase.WARMUP,
-                    phaseDurationMs = BenchmarkConfig.WARMUP_MS,
-                )
-                sleepInterruptibly(BenchmarkConfig.WARMUP_MS)
+            for (precision in precisionModes) {
                 if (cancelRequested) break
+                prefs.setFramegenFp16(precision.nativeFp16Flag)
+                Log.i(TAG, "switching to precision=${precision.label}")
 
-                publishRunning(
-                    runIndex = idx,
-                    totalRuns = BenchmarkConfig.MULTIPLIERS.size,
-                    multiplier = mult,
-                    phase = Phase.SAMPLING,
-                    phaseDurationMs = BenchmarkConfig.RUN_DURATION_SEC * 1000L,
-                )
-                val result = BenchmarkRunner.collect(
-                    multiplier = mult,
-                    flowScale = BenchmarkConfig.FLOW_SCALE,
-                    performanceMode = BenchmarkConfig.PERFORMANCE_MODE,
-                    durationMs = BenchmarkConfig.RUN_DURATION_SEC * 1000L,
-                    sampleIntervalMs = BenchmarkConfig.SAMPLE_INTERVAL_MS,
-                    nominalVsyncPeriodNs = hooks.vsyncPeriodNs(),
-                    shouldStop = { cancelRequested },
-                )
-                results.add(result)
-                Log.i(TAG, "run ${idx + 1} complete: posted=${result.totalPostedFrames} " +
-                    "fps=${"%.2f".format(result.postedFps)} stalls=${result.stallCount}")
+                for (mult in BenchmarkConfig.MULTIPLIERS) {
+                    if (cancelRequested) {
+                        val cancelState = State.Failed("Cancelled by user during run ${globalIdx + 1}")
+                        state.set(cancelState)
+                        postToMain { hooks.onFailed(cancelState) }
+                        return
+                    }
+                    Log.i(TAG, "starting run ${globalIdx + 1}/$totalRuns " +
+                        "precision=${precision.label} multiplier=$mult")
+                    prefs.setMultiplier(mult)
+                    hooks.requestReinit()
+
+                    publishRunning(
+                        runIndex = globalIdx,
+                        totalRuns = totalRuns,
+                        multiplier = mult,
+                        precision = precision,
+                        phase = Phase.WARMUP,
+                        phaseDurationMs = BenchmarkConfig.WARMUP_MS,
+                    )
+                    sleepInterruptibly(BenchmarkConfig.WARMUP_MS)
+                    if (cancelRequested) break
+
+                    publishRunning(
+                        runIndex = globalIdx,
+                        totalRuns = totalRuns,
+                        multiplier = mult,
+                        precision = precision,
+                        phase = Phase.SAMPLING,
+                        phaseDurationMs = BenchmarkConfig.RUN_DURATION_SEC * 1000L,
+                    )
+                    val result = BenchmarkRunner.collect(
+                        multiplier = mult,
+                        flowScale = BenchmarkConfig.FLOW_SCALE,
+                        performanceMode = BenchmarkConfig.PERFORMANCE_MODE,
+                        framegenFp16 = precision.nativeFp16Flag,
+                        durationMs = BenchmarkConfig.RUN_DURATION_SEC * 1000L,
+                        sampleIntervalMs = BenchmarkConfig.SAMPLE_INTERVAL_MS,
+                        nominalVsyncPeriodNs = hooks.vsyncPeriodNs(),
+                        shouldStop = { cancelRequested },
+                    )
+                    results.add(result)
+                    Log.i(TAG, "run ${globalIdx + 1} complete: precision=${precision.label} " +
+                        "posted=${result.totalPostedFrames} " +
+                        "fps=${"%.2f".format(result.postedFps)} stalls=${result.stallCount}")
+                    globalIdx++
+                }
             }
 
             if (cancelRequested) {
@@ -241,6 +274,7 @@ object BenchmarkController {
                 prefs.setFlowScale(savedFlowScale)
                 prefs.setPerformance(savedPerformance)
                 prefs.setAntiArtifacts(savedAntiArtifacts)
+                prefs.setFramegenFp16(savedFramegenFp16)
                 prefs.setNpuPostProcessingEnabled(savedNpuEnabled)
                 prefs.setNpuPostProcessingPreset(savedNpuPreset)
                 prefs.setCpuPostProcessingEnabled(savedCpuEnabled)
@@ -261,6 +295,7 @@ object BenchmarkController {
         runIndex: Int,
         totalRuns: Int,
         multiplier: Int,
+        precision: PrecisionMode,
         phase: Phase,
         phaseDurationMs: Long,
     ) {
@@ -269,6 +304,7 @@ object BenchmarkController {
                 runIndex = runIndex,
                 totalRuns = totalRuns,
                 multiplier = multiplier,
+                precision = precision,
                 phase = phase,
                 phaseStartedAtMs = System.currentTimeMillis(),
                 phaseDurationMs = phaseDurationMs,

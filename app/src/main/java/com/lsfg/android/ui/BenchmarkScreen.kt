@@ -74,6 +74,13 @@ fun BenchmarkScreen(nav: NavHostController) {
     // 100 ms native cadence, fully decoupled.
     var controllerState by remember { mutableStateOf<BenchmarkController.State>(BenchmarkController.State.Idle) }
     var lastReport by remember { mutableStateOf<File?>(null) }
+    // Probe once: shows the user upfront whether the dual FP32/FP16 pass will
+    // run. Same gate the in-app FP16 toggle uses — needs both shaderFloat16
+    // on the GPU and the fp16/ shader cache populated.
+    val fp16Supported = remember {
+        val cacheDir = java.io.File(ctx.filesDir, "spirv").absolutePath
+        runCatching { com.lsfg.android.session.NativeBridge.isFramegenFp16Supported(cacheDir) }.getOrDefault(false)
+    }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -160,6 +167,14 @@ fun BenchmarkScreen(nav: NavHostController) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (fp16Supported) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = stringResource(R.string.benchmark_dual_precision_summary),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LsfgPrimary,
+                    )
+                }
             }
 
             // Live progress card while a benchmark is running.
@@ -186,6 +201,14 @@ fun BenchmarkScreen(nav: NavHostController) {
                             )
                     }
                     Text(text = label, style = MaterialTheme.typography.titleMedium)
+                    // Surface the active precision pass so the user sees the
+                    // FP32→FP16 transition mid-benchmark instead of guessing.
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "Precision: ${running.precision.label}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LsfgPrimary,
+                    )
                     Spacer(Modifier.height(12.dp))
                     LinearProgressIndicator(
                         progress = { progress },
@@ -265,12 +288,44 @@ fun BenchmarkScreen(nav: NavHostController) {
                         lastError = ctx.getString(R.string.perm_overlay_missing)
                         return@Button
                     }
-                    val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice())
-                    } else {
-                        mpm.createScreenCaptureIntent()
+                    // Honour the user's capture-source preference instead of
+                    // forcing MediaProjection. Shizuku and Root skip the system
+                    // recording dialog entirely — same pattern HomeScreen uses
+                    // for normal sessions.
+                    when (state.captureSource) {
+                        CaptureSource.SHIZUKU -> {
+                            ctx.packageManager.getLaunchIntentForPackage(target)?.let { launch ->
+                                ctx.startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            }
+                            ContextCompat.startForegroundService(
+                                ctx,
+                                LsfgForegroundService.buildShizukuBenchmarkStartIntent(
+                                    ctx = ctx,
+                                    targetPackage = target,
+                                ),
+                            )
+                        }
+                        CaptureSource.ROOT -> {
+                            ctx.packageManager.getLaunchIntentForPackage(target)?.let { launch ->
+                                ctx.startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            }
+                            ContextCompat.startForegroundService(
+                                ctx,
+                                LsfgForegroundService.buildRootBenchmarkStartIntent(
+                                    ctx = ctx,
+                                    targetPackage = target,
+                                ),
+                            )
+                        }
+                        CaptureSource.MEDIA_PROJECTION -> {
+                            val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice())
+                            } else {
+                                mpm.createScreenCaptureIntent()
+                            }
+                            projectionLauncher.launch(captureIntent)
+                        }
                     }
-                    projectionLauncher.launch(captureIntent)
                 },
                 enabled = canStart,
                 shape = MaterialTheme.shapes.small,

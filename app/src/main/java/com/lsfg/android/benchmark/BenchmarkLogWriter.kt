@@ -71,6 +71,10 @@ object BenchmarkLogWriter {
         sb.appendLine("[benchmark_preset]")
         sb.appendLine("flow_scale       = ${BenchmarkConfig.FLOW_SCALE}")
         sb.appendLine("performance_mode = ${BenchmarkConfig.PERFORMANCE_MODE}")
+        // Show whether this run captured both precisions; the controller may
+        // have skipped FP16 if shaderFloat16 isn't supported on this device.
+        val precisions = results.map { if (it.framegenFp16) "FP16" else "FP32" }.distinct()
+        sb.appendLine("precisions       = ${precisions.joinToString(",")}")
         sb.appendLine("run_duration_s   = ${BenchmarkConfig.RUN_DURATION_SEC}")
         sb.appendLine("warmup_ms        = ${BenchmarkConfig.WARMUP_MS}")
         sb.appendLine("sample_hz        = ${1000L / BenchmarkConfig.SAMPLE_INTERVAL_MS}")
@@ -79,8 +83,10 @@ object BenchmarkLogWriter {
 
         // --- Per-run results ----------------------------------------------
         for (r in results) {
-            sb.appendLine("[run_x${r.multiplier}]")
+            val precisionTag = if (r.framegenFp16) "fp16" else "fp32"
+            sb.appendLine("[run_${precisionTag}_x${r.multiplier}]")
             sb.appendLine("multiplier       = ${r.multiplier}")
+            sb.appendLine("precision        = ${if (r.framegenFp16) "FP16" else "FP32"}")
             sb.appendLine("duration_ms      = ${r.runDurationMs}")
             sb.appendLine("real_fps         = ${"%.2f".format(Locale.US, r.realFps)}")
             sb.appendLine("generated_fps    = ${"%.2f".format(Locale.US, r.generatedFps)}")
