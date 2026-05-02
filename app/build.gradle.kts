@@ -16,9 +16,12 @@ android {
         versionCode = 1
         versionName = "0.1.1"
 
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
-        }
+        // ABI filtering is handled by the splits { abi } block below (which
+        // both restricts the build set to arm64-v8a/x86_64 and emits per-ABI
+        // APKs). Setting ndk.abiFilters here as well is a Gradle conflict
+        // ("ndk abiFilters cannot be present when splits abi filters are set")
+        // and is redundant — the splits filters already gate which ABIs the
+        // NDK toolchain ever gets invoked for.
 
         externalNativeBuild {
             cmake {
