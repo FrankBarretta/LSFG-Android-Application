@@ -57,6 +57,16 @@ struct VulkanSession {
     // globals.
     VolkDeviceTable fn{};
 
+    // Per-instance function pointers we resolved against OUR instance. Same
+    // problem as VolkDeviceTable above but at instance scope: framegen's
+    // Instance::Instance() creates its own VkInstance without surface
+    // extensions and calls volkLoadInstance() on it, which clobbers the global
+    // vkCreateAndroidSurfaceKHR pointer (the new instance can't resolve it,
+    // so volk overwrites the global with NULL). Save our resolved pointer
+    // here at session-init time and use it from the render loop instead of
+    // the volk global.
+    PFN_vkCreateAndroidSurfaceKHR pfnCreateAndroidSurfaceKHR = nullptr;
+
     // Device UUID packed the way framegen expects: vendorID<<32 | deviceID.
     // Pass this to LSFG_3_1::initialize.
     uint64_t deviceUuid = 0;

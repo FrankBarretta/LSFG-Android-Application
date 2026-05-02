@@ -163,6 +163,30 @@ int create_session(VulkanSession &out) {
     }
     volkLoadInstance(out.instance);
 
+    // Resolve vkCreateAndroidSurfaceKHR against OUR instance and stash the
+    // pointer in the session. Two reasons we can't rely on the volk global:
+    //   1. On some drivers (observed on Adreno 840 / Vulkan 1.4 and various
+    //      Mali firmwares) volk's normal load path doesn't populate the
+    //      symbol even when VK_KHR_android_surface was accepted by
+    //      vkCreateInstance — vkGetInstanceProcAddr resolves it manually.
+    //   2. Even if volkLoadInstance loaded it correctly, framegen's
+    //      Instance::Instance() will later call volkLoadInstance() against
+    //      its own VkInstance (created without surface extensions), which
+    //      overwrites the global pointer to NULL. The render loop reads the
+    //      pointer at swapchain-creation time, after framegen init, so the
+    //      global is unreliable.
+    // The render loop reads out.pfnCreateAndroidSurfaceKHR instead.
+    if (hasSurfaceExts) {
+        out.pfnCreateAndroidSurfaceKHR = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
+            vkGetInstanceProcAddr(out.instance, "vkCreateAndroidSurfaceKHR"));
+        if (out.pfnCreateAndroidSurfaceKHR != nullptr) {
+            LOGI("vkCreateAndroidSurfaceKHR resolved and cached on session");
+        } else {
+            LOGW("vkCreateAndroidSurfaceKHR unresolvable on this driver — disabling WSI");
+            hasSurfaceExts = false;
+        }
+    }
+
     out.physicalDevice = pick_physical_device(out.instance);
     if (out.physicalDevice == VK_NULL_HANDLE) {
         LOGE("No physical device with all required extensions");
