@@ -8,6 +8,7 @@ import android.hardware.HardwareBuffer
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import com.lsfg.android.shizuku.IShizukuCaptureService
 import com.lsfg.android.shizuku.IShizukuFrameCallback
@@ -213,7 +214,18 @@ class RootCaptureEngine(private val ctx: Context) {
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private fun bind() {
+        // libsu's RootService.bind enforces main-thread invocation. start() may
+        // be called from the foreground service's worker thread (e.g. on a
+        // surface-geometry change), so hop to the main looper if we're not
+        // already there. Without this the bind throws IllegalStateException and
+        // the root capture path silently never arms.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { bind() }
+            return
+        }
         everConnected = false
         runCatching {
             val intent = Intent(ctx, RootCaptureService::class.java)

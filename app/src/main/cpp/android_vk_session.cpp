@@ -163,6 +163,22 @@ int create_session(VulkanSession &out) {
     }
     volkLoadInstance(out.instance);
 
+    // Some Android drivers (HyperOS Adreno builds, certain Mali firmwares) accept
+    // VK_KHR_android_surface at vkCreateInstance but don't expose
+    // vkCreateAndroidSurfaceKHR through the loader's normal export path, leaving
+    // volk's global pointer NULL. Resolve manually; if it still doesn't show up,
+    // tell the rest of the engine WSI is unavailable so it picks the CPU blit
+    // path cleanly instead of half-arming a swapchain it can never present on.
+    if (hasSurfaceExts && vkCreateAndroidSurfaceKHR == nullptr) {
+        vkCreateAndroidSurfaceKHR =
+            reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
+                vkGetInstanceProcAddr(out.instance, "vkCreateAndroidSurfaceKHR"));
+        if (vkCreateAndroidSurfaceKHR == nullptr) {
+            LOGW("vkCreateAndroidSurfaceKHR unresolvable on this driver — disabling WSI");
+            hasSurfaceExts = false;
+        }
+    }
+
     out.physicalDevice = pick_physical_device(out.instance);
     if (out.physicalDevice == VK_NULL_HANDLE) {
         LOGE("No physical device with all required extensions");
