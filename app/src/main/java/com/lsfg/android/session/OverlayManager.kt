@@ -16,6 +16,8 @@ import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.VsyncRefreshOverride
@@ -56,6 +58,9 @@ class OverlayManager(private val ctx: Context) {
     private var hostWindowManager: WindowManager? = null
     private var fpsView: TextView? = null
     private var graphView: FrameGraphView? = null
+    private var benchmarkPanel: LinearLayout? = null
+    private var benchmarkLabel: TextView? = null
+    private var benchmarkBar: ProgressBar? = null
     private var insetsListener: Any? = null
     private var internalInsetsListener: Any? = null
     private var frameLoopCallback: Choreographer.FrameCallback? = null
@@ -320,6 +325,57 @@ class OverlayManager(private val ctx: Context) {
             },
         )
 
+        // Benchmark progress panel — pinned to the top-center of the overlay,
+        // hidden until BenchmarkController publishes a Running state. Hosts
+        // a one-line label ("Run x/y · FP16 ×3 — sampling 28s left") and a
+        // horizontal ProgressBar that fills as the current phase advances and
+        // is reset at every phase transition.
+        val benchPanel = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xB0000000.toInt())
+            val padH = (metrics.density * 12f).toInt()
+            val padV = (metrics.density * 8f).toInt()
+            setPadding(padH, padV, padH, padV)
+            visibility = View.GONE
+        }
+        val benchLabel = TextView(ctx).apply {
+            text = ""
+            setTextColor(Color.WHITE)
+            textSize = 13f
+        }
+        val benchBar = ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progress = 0
+            isIndeterminate = false
+        }
+        benchPanel.addView(
+            benchLabel,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        benchPanel.addView(
+            benchBar,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (metrics.density * 6f).toInt(),
+            ).apply {
+                topMargin = (metrics.density * 4f).toInt()
+            },
+        )
+        val benchWidthPx = (metrics.density * 320f).toInt()
+        layout.addView(
+            benchPanel,
+            FrameLayout.LayoutParams(
+                benchWidthPx,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+            ).apply {
+                topMargin = 24
+            },
+        )
+
         wm.addView(layout, params)
 
         // Mark the overlay's SurfaceControl with skipScreenshot so SurfaceFlinger
@@ -345,6 +401,9 @@ class OverlayManager(private val ctx: Context) {
         root = layout
         fpsView = fps
         graphView = graph
+        benchmarkPanel = benchPanel
+        benchmarkLabel = benchLabel
+        benchmarkBar = benchBar
         textureView = tex
     }
 
@@ -402,6 +461,41 @@ class OverlayManager(private val ctx: Context) {
         g.post { g.pushSample(realFps, generatedFps) }
     }
 
+    /**
+     * Show the benchmark progress panel (idempotent). The panel is hidden by
+     * default and only revealed while a benchmark is running.
+     */
+    fun setBenchmarkProgressVisible(visible: Boolean) {
+        val p = benchmarkPanel ?: return
+        p.post {
+            p.visibility = if (visible) View.VISIBLE else View.GONE
+            if (!visible) {
+                benchmarkBar?.progress = 0
+                benchmarkLabel?.text = ""
+            }
+        }
+    }
+
+    /**
+     * Update the benchmark progress panel.
+     *
+     * @param label one-line status, e.g. "Run 2/6 · FP32 ×3 — sampling"
+     * @param elapsedMs elapsed time inside the current phase
+     * @param totalMs total length of the current phase
+     */
+    fun updateBenchmarkProgress(label: String, elapsedMs: Long, totalMs: Long) {
+        val l = benchmarkLabel ?: return
+        val b = benchmarkBar ?: return
+        val clampedTotal = totalMs.coerceAtLeast(1L)
+        val ratio = (elapsedMs.toFloat() / clampedTotal).coerceIn(0f, 1f)
+        val remainingSec = ((clampedTotal - elapsedMs).coerceAtLeast(0L) + 999L) / 1000L
+        val text = "$label  ·  ${remainingSec}s left"
+        l.post {
+            l.text = text
+            b.progress = (ratio * 1000f).toInt()
+        }
+    }
+
     fun hide() {
         val r = root ?: return
         insetsListener?.let { removeEmptyTouchableRegion(r, it) }
@@ -418,6 +512,10 @@ class OverlayManager(private val ctx: Context) {
         root = null
         textureView = null
         fpsView = null
+        graphView = null
+        benchmarkPanel = null
+        benchmarkLabel = null
+        benchmarkBar = null
         hostWindowManager = null
     }
 

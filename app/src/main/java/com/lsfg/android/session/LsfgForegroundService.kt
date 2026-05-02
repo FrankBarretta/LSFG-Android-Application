@@ -92,6 +92,10 @@ class LsfgForegroundService : Service() {
     private var benchmarkRequested: Boolean = false
     @Volatile
     private var benchmarkStarted: Boolean = false
+    /** Polls [BenchmarkController.currentState] to feed the in-overlay
+     *  progress panel. Started in [maybeStartBenchmark]; cancelled when
+     *  the controller reaches Completed/Failed or the service tears down. */
+    private var benchmarkProgressPoller: Runnable? = null
     private var pendingPrivilegedVideoStart: ShizukuVideoStart? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     // Display rotation listener — Service.onConfigurationChanged only fires
@@ -176,6 +180,7 @@ class LsfgForegroundService : Service() {
         // images — SIGSEGV on the next access. This was the "stop overlay
         // crashes when settings stop applying" symptom.
         shuttingDown = true
+        stopBenchmarkProgressPoller()
         // Wait on the latch instead of polling — frees the Main thread looper
         // to deliver pending input events instead of sleeping in 20 ms ticks.
         val latch = reinitDoneLatch
@@ -532,10 +537,20 @@ class LsfgForegroundService : Service() {
         // started AFTER the main capture is running — on Android 14 MediaTek/
         // PowerVR the system revokes MediaProjection if a second VirtualDisplay
         // is created while the first token is still unconsumed.
-        if (initialFpsCounter) {
+        //
+        // When a benchmark session is starting we force the FPS counter ON
+        // regardless of the user's last toggle state — the run is meaningless
+        // without the live real/total readout, and the in-overlay benchmark
+        // progress panel (shown below) is also revealed.
+        val effectiveFpsCounter = initialFpsCounter || benchmarkRequested
+        if (effectiveFpsCounter) {
             ov.setFpsVisible(true)
         }
-        pendingFpsCounter = initialFpsCounter
+        pendingFpsCounter = effectiveFpsCounter
+        if (benchmarkRequested) {
+            ov.setBenchmarkProgressVisible(true)
+            ov.updateBenchmarkProgress("Benchmark — preparing", 0L, 1L)
+        }
 
         // Frame pacing graph is purely a diagnostic overlay — no intent extra needed,
         // read the persisted pref directly so it restores across service restarts.
@@ -596,7 +611,7 @@ class LsfgForegroundService : Service() {
                 overlay?.setFrameGraphVisible(false)
             }
         }
-        dr.setInitialFpsCounterState(initialFpsCounter)
+        dr.setInitialFpsCounterState(effectiveFpsCounter)
         dr.setInitialFrameGraphState(initialFrameGraph)
         dr.setLiveParamsListener {
             reinitLsfgContext()
@@ -781,6 +796,7 @@ class LsfgForegroundService : Service() {
         if (shuttingDown) return
         benchmarkStarted = true
         LsfgLog.i(TAG, "starting BenchmarkController")
+        startBenchmarkProgressPoller()
         BenchmarkController.start(applicationContext, object : BenchmarkController.Hooks {
             override fun requestReinit() {
                 // Mirror the live-drawer code path so the controller doesn't
@@ -805,6 +821,8 @@ class LsfgForegroundService : Service() {
                 // Stash the report file for the UI to pick up.
                 lastBenchmarkReport = state.reportFile
                 mainHandler.post {
+                    stopBenchmarkProgressPoller()
+                    overlay?.setBenchmarkProgressVisible(false)
                     runCatching {
                         val intent = BenchmarkLogWriter.buildShareIntent(
                             this@LsfgForegroundService, state.reportFile,
@@ -822,9 +840,74 @@ class LsfgForegroundService : Service() {
             }
             override fun onFailed(state: BenchmarkController.State.Failed) {
                 LsfgLog.w(TAG, "benchmark failed: ${state.message}")
-                mainHandler.post { stopSelf() }
+                mainHandler.post {
+                    stopBenchmarkProgressPoller()
+                    overlay?.setBenchmarkProgressVisible(false)
+                    stopSelf()
+                }
             }
         })
+    }
+
+    /**
+     * Drives the in-overlay benchmark progress panel by polling the
+     * [BenchmarkController] state at 200 ms (the same cadence the Compose
+     * BenchmarkScreen uses, so the two stay visually in sync). The poller
+     * computes the elapsed/total fraction inside the current Running phase
+     * (warmup or sampling) and pushes it to [OverlayManager.updateBenchmarkProgress].
+     *
+     * Each phase resets the bar to 0 and refills as the phase advances; the
+     * label shows "Run x/y · <precision> ×<mult> — warming up | sampling" so
+     * the user can see how much of the run is left without leaving the game.
+     */
+    private fun startBenchmarkProgressPoller() {
+        if (benchmarkProgressPoller != null) return
+        val poll = object : Runnable {
+            override fun run() {
+                val ov = overlay
+                val st = BenchmarkController.currentState()
+                if (ov == null) {
+                    // Overlay torn down — exit the loop; teardown path will
+                    // null the field below the next time we look.
+                    benchmarkProgressPoller = null
+                    return
+                }
+                when (st) {
+                    is BenchmarkController.State.Running -> {
+                        val elapsed = (System.currentTimeMillis() - st.phaseStartedAtMs)
+                            .coerceAtLeast(0L)
+                        val phase = when (st.phase) {
+                            BenchmarkController.Phase.WARMUP -> "warming up"
+                            BenchmarkController.Phase.SAMPLING -> "sampling"
+                        }
+                        val label = "Run ${st.runIndex + 1}/${st.totalRuns} · " +
+                            "${st.precision.label} ×${st.multiplier} — $phase"
+                        ov.updateBenchmarkProgress(label, elapsed, st.phaseDurationMs)
+                        mainHandler.postDelayed(this, 200L)
+                    }
+                    is BenchmarkController.State.Completed,
+                    is BenchmarkController.State.Failed -> {
+                        // The controller's onCompleted/onFailed callbacks
+                        // already handle hiding the panel and stopping the
+                        // service — just exit the loop.
+                        benchmarkProgressPoller = null
+                    }
+                    BenchmarkController.State.Idle -> {
+                        // Controller hasn't published Running yet — keep
+                        // the "preparing" label visible and check again.
+                        mainHandler.postDelayed(this, 200L)
+                    }
+                }
+            }
+        }
+        benchmarkProgressPoller = poll
+        mainHandler.post(poll)
+    }
+
+    private fun stopBenchmarkProgressPoller() {
+        val p = benchmarkProgressPoller
+        benchmarkProgressPoller = null
+        if (p != null) mainHandler.removeCallbacks(p)
     }
 
     private fun launchTarget(pkg: String) {
