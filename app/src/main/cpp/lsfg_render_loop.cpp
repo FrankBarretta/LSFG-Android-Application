@@ -532,7 +532,15 @@ bool createSwapchain() {
     if (!g.vk.hasSwapchain) return false;
     if (g.outWindow == nullptr) return false;
     if (g.vk.instance == VK_NULL_HANDLE) return false;
-    if (vkCreateAndroidSurfaceKHR == nullptr) {
+    // Use the session-cached function pointer instead of volk's global. The
+    // global gets clobbered to NULL when framegen's Instance::Instance()
+    // calls volkLoadInstance() against its own surface-less VkInstance,
+    // because that instance can't resolve vkCreateAndroidSurfaceKHR. The
+    // session pointer was resolved against OUR instance at session-init time
+    // and survives that overwrite.
+    PFN_vkCreateAndroidSurfaceKHR pfnCreateSurface = g.vk.pfnCreateAndroidSurfaceKHR;
+    if (pfnCreateSurface == nullptr) pfnCreateSurface = vkCreateAndroidSurfaceKHR;
+    if (pfnCreateSurface == nullptr) {
         LOGW("vkCreateAndroidSurfaceKHR fn ptr is NULL — volk didn't load it");
         return false;
     }
@@ -542,8 +550,9 @@ bool createSwapchain() {
         .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
         .window = g.outWindow,
     };
-    if (vkCreateAndroidSurfaceKHR(g.vk.instance, &sci, nullptr, &g.swap.surface) != VK_SUCCESS) {
-        LOGW("vkCreateAndroidSurfaceKHR failed — falling back to CPU blit");
+    const VkResult sres = pfnCreateSurface(g.vk.instance, &sci, nullptr, &g.swap.surface);
+    if (sres != VK_SUCCESS) {
+        LOGW("vkCreateAndroidSurfaceKHR failed (rc=%d) — falling back to CPU blit", (int)sres);
         g.swap.surface = VK_NULL_HANDLE;
         return false;
     }
@@ -1758,8 +1767,10 @@ void workerThread() {
                 shizuku.enabled &&
                 shizuku.frameTimeNs > 0 &&
                 shizuku.timestampNs >= pendingFrame.captureTimestampNs;
-            if (haveShizukuCadence || (havePrevCaptureTimestamp &&
-                    pendingFrame.captureTimestampNs > prevCaptureTimestampNs)) {
+            const bool haveCaptureDelta =
+                havePrevCaptureTimestamp &&
+                pendingFrame.captureTimestampNs > prevCaptureTimestampNs;
+            if (haveShizukuCadence || haveCaptureDelta) {
                 // Hard floor (125 Hz) and absolute ceiling (1 Hz). The ceiling
                 // prevents the worker from sleeping for many seconds if the
                 // source genuinely runs slower than 1 fps — at that point pacing
@@ -1767,9 +1778,23 @@ void workerThread() {
                 constexpr double minNs = 8.0  * 1'000'000.0;  // 125 Hz
                 constexpr double absMaxNs = 1000.0 * 1'000'000.0; // 1 Hz
 
-                double rawNs = haveShizukuCadence
-                    ? static_cast<double>(shizuku.frameTimeNs)
-                    : static_cast<double>(pendingFrame.captureTimestampNs - prevCaptureTimestampNs);
+                // Prefer the inter-capture timestamp delta when available: it
+                // measures the actual game-render cadence. Shizuku/Root capture
+                // services report a frameTimeNs that is the inter-arrival of
+                // buffers from the capture transport (display refresh rate, on
+                // some devices ~3 ms), not the underlying render rate — using
+                // it would clamp captureInterval to the 8 ms minNs floor, and
+                // remainingBudget = captureInterval - (copy+present+waitIdle)
+                // would always go negative, leaving step=0 so the pacing loop
+                // posts every generated frame immediately. SurfaceFlinger then
+                // drops all of them and the user sees only the real frame.
+                double rawNs;
+                if (haveCaptureDelta) {
+                    rawNs = static_cast<double>(
+                        pendingFrame.captureTimestampNs - prevCaptureTimestampNs);
+                } else {
+                    rawNs = static_cast<double>(shizuku.frameTimeNs);
+                }
                 if (rawNs < minNs) rawNs = minNs;
 
                 if (!emaInit) {
@@ -1823,14 +1848,18 @@ void workerThread() {
                     if (rawNs < capFloorNs) rawNs = capFloorNs;
                 }
 
-                if (!suppressGeneratedFrames && haveShizukuCadence) {
-                    const double jitterNs =
-                        static_cast<double>(std::max<int64_t>(0, shizuku.pacingJitterNs));
-                    const double jitterGateNs = std::max(2.0 * 1'000'000.0, rawNs * 0.35);
-                    if (jitterNs >= jitterGateNs) {
-                        suppressGeneratedFrames = true;
-                    }
-                }
+                // Anti-jitter gate disabled: on at least one device pairing
+                // (Adreno 840 + Shizuku capture service on Snapdragon) the
+                // reported pacingJitterNs is dominated by the sampling noise of
+                // the metrics service rather than actual render-rate jitter,
+                // so jitter routinely exceeds 35% of rawNs and this gate
+                // suppressed every generated frame — the user saw only the
+                // real capture rate even though the HUD claimed framegen was
+                // active. The original purpose was to avoid optical-flow
+                // artefacts on fast camera motion; that case is already handled
+                // by the antiArtifacts content-similarity check earlier in this
+                // function (shouldSuppressGeneratedFrames).
+                (void)haveShizukuCadence;
 
                 captureInterval = std::chrono::nanoseconds(
                     static_cast<int64_t>(rawNs));
