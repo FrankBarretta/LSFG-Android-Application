@@ -96,6 +96,13 @@ struct State {
     uint32_t swapWinW = 0;
     uint32_t swapWinH = 0;
     std::atomic<bool> bypass{false}; // skip framegen, blit raw input
+    // Auto-bypass triggered when framegen returns VK_ERROR_DEVICE_LOST during
+    // presentContext. Distinct from the user-controlled `bypass` so the user
+    // toggle isn't silently flipped by a recoverable driver event. Cleared on
+    // every initRenderLoop / context recreation — if the next session
+    // succeeds, framegen runs again. Stuck-on means the next presentContext
+    // would error too, so passthrough is the right behaviour anyway.
+    std::atomic<bool> framegenAutoDisabled{false};
     std::atomic<bool> antiArtifacts{false};
     bool npuPostProcessing = false;
     int npuPreset = 0;
@@ -127,6 +134,18 @@ struct State {
     ANativeWindow *outWindow = nullptr;
     uint32_t outWidth = 0;
     uint32_t outHeight = 0;
+    // Once we have produced a CPU buffer on this ANativeWindow (via
+    // ANativeWindow_lock / setBuffersGeometry), the BufferQueue is bound to a
+    // CPU producer. Mali (Bifrost/Valhall) and many other drivers will then
+    // return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (-1000000001) for any subsequent
+    // vkCreateAndroidSurfaceKHR on the same native window — the producer slot
+    // can't be retargeted live. We track this taint per-attached window and
+    // skip the WSI swapchain attempt entirely, avoiding the spammy retries seen
+    // on Mali-G57 and the cascade where a failed surface creation correlates
+    // with a DEVICE_LOST on framegen's compute queue. Reset on each
+    // setOutputSurface(win) call, since a freshly-acquired ANativeWindow has
+    // no producer yet.
+    bool windowCpuProducerLocked = false;
     // Last geometry successfully passed to ANativeWindow_setBuffersGeometry.
     // We guard the call so it only fires when parameters actually change —
     // calling it on every blit triggers a SurfaceTexture buffer-queue
@@ -524,14 +543,25 @@ void destroySwapchain() {
 //
 // Safe to call multiple times; previous swapchain is torn down first.
 bool createSwapchain() {
-    LOGI("createSwapchain: enter outWindow=%p hasSwapchain=%d enable=%d",
+    LOGI("createSwapchain: enter outWindow=%p hasSwapchain=%d enable=%d cpuTainted=%d",
          static_cast<void *>(g.outWindow), (int)g.vk.hasSwapchain,
-         (int)kEnableWsiSwapchain);
+         (int)kEnableWsiSwapchain, (int)g.windowCpuProducerLocked);
     destroySwapchain();
     if (!kEnableWsiSwapchain) return false;
     if (!g.vk.hasSwapchain) return false;
     if (g.outWindow == nullptr) return false;
     if (g.vk.instance == VK_NULL_HANDLE) return false;
+    // Once the worker has produced any CPU buffer on this ANativeWindow
+    // (overlay clear, CPU blit fallback, etc.) the BufferQueue is locked to
+    // a CPU producer and vkCreateAndroidSurfaceKHR will return
+    // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (-1000000001) on Mali / many other
+    // drivers. Don't even attempt — failed surface creation has been observed
+    // to correlate with framegen-side DEVICE_LOST on Mali-G57 (likely an
+    // instance-level state corruption when the WSI driver path bails late).
+    if (g.windowCpuProducerLocked) {
+        LOGI("createSwapchain: skipping — window already bound to CPU producer this session");
+        return false;
+    }
     // Use the session-cached function pointer instead of volk's global. The
     // global gets clobbered to NULL when framegen's Instance::Instance()
     // calls volkLoadInstance() against its own surface-less VkInstance,
@@ -552,7 +582,20 @@ bool createSwapchain() {
     };
     const VkResult sres = pfnCreateSurface(g.vk.instance, &sci, nullptr, &g.swap.surface);
     if (sres != VK_SUCCESS) {
-        LOGW("vkCreateAndroidSurfaceKHR failed (rc=%d) — falling back to CPU blit", (int)sres);
+        // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR means the ANativeWindow is locked
+        // to a CPU producer (or another consumer). The state is sticky — no
+        // amount of retrying on the same window will recover. Pin the taint
+        // so subsequent createSwapchain calls bail at the early gate above
+        // instead of repeating the same failed driver call (which on some
+        // Mali / Adreno revisions can leave the instance in a tainted state
+        // and induce a DEVICE_LOST on framegen's separate device).
+        if (sres == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+            g.windowCpuProducerLocked = true;
+            LOGW("vkCreateAndroidSurfaceKHR: window in use by CPU producer (rc=%d) — WSI disabled for this surface; using CPU blit",
+                 (int)sres);
+        } else {
+            LOGW("vkCreateAndroidSurfaceKHR failed (rc=%d) — falling back to CPU blit", (int)sres);
+        }
         g.swap.surface = VK_NULL_HANDLE;
         return false;
     }
@@ -1454,6 +1497,9 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
         LOGW("ANativeWindow_lock failed");
         return;
     }
+    // The window is now (and stays) bound to a CPU producer for this session.
+    // Pre-pin the taint so the next createSwapchain attempt bails fast.
+    g.windowCpuProducerLocked = true;
     const uint32_t dstStrideBytes = static_cast<uint32_t>(dst.stride) * 4;
 
     auto *src = static_cast<const uint8_t *>(srcPtr);
@@ -1586,6 +1632,11 @@ void workerThread() {
                    static_cast<size_t>(clearBuf.stride) *
                    static_cast<size_t>(clearBuf.height) * 4);
             ANativeWindow_unlockAndPost(g.outWindow);
+            // The BufferQueue is now bound to a CPU producer for this window.
+            // Any later createSwapchain attempt would fail with
+            // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR — pre-pin the taint so we
+            // don't even try (see createSwapchain for rationale).
+            g.windowCpuProducerLocked = true;
             LOGI("workerThread: cleared overlay to transparent");
         }
     }
@@ -1725,7 +1776,8 @@ void workerThread() {
         const auto tCopyDone = State::Clock::now();
 
         const bool runFramegen = g.framegenCtxId >= 0
-                                 && !g.bypass.load(std::memory_order_relaxed);
+                                 && !g.bypass.load(std::memory_order_relaxed)
+                                 && !g.framegenAutoDisabled.load(std::memory_order_relaxed);
         if (runFramegen) {
             // No semaphores in this minimal path — synchronous via queue idle.
             std::vector<int> outSems;  // empty
@@ -1735,7 +1787,21 @@ void workerThread() {
                 else
                     LSFG_3_1::presentContext(g.framegenCtxId, /*inSem*/ -1, outSems);
             } catch (const std::exception &e) {
-                LOGE("presentContext threw: %s", e.what());
+                const char *what = e.what() != nullptr ? e.what() : "(null)";
+                LOGE("presentContext threw: %s", what);
+                // Detect VK_ERROR_DEVICE_LOST (-4): framegen's compute device
+                // is gone (driver crash, OOM, surface-instance state mishap on
+                // Mali-G57 etc.). Every subsequent submit on a lost device
+                // returns -4 too — auto-disable framegen for this session and
+                // fall through to passthrough so the overlay still shows the
+                // captured stream instead of erroring on every frame. Cleared
+                // on the next initRenderLoop, when the device is recreated.
+                const bool isDeviceLost = std::strstr(what, "error -4") != nullptr ||
+                                          std::strstr(what, "DEVICE_LOST")  != nullptr;
+                if (isDeviceLost && !g.framegenAutoDisabled.load(std::memory_order_relaxed)) {
+                    LOGE("presentContext: VK_ERROR_DEVICE_LOST — auto-disabling framegen for this session (passthrough until next context reinit)");
+                    g.framegenAutoDisabled.store(true, std::memory_order_relaxed);
+                }
                 continue;
             }
             // PROFILE: presentContext returned (CPU-side; the GPU work is
@@ -2096,6 +2162,11 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     // Don't reset g.bypass — the user toggle should persist across re-inits
     // (e.g. when they change multiplier while bypass is on, the new context
     // should also start in bypass).
+    // DO reset the framegen auto-disable latch — that flag tracks a driver
+    // error tied to the previous device handle, which is being recreated here.
+    // Carrying it forward would silently keep framegen off forever after one
+    // bad submit, even on a healthy new device.
+    g.framegenAutoDisabled.store(false, std::memory_order_relaxed);
 
     int rc = create_session(g.vk);
     if (rc != kOk) {
@@ -2183,6 +2254,11 @@ void setOutputSurface(ANativeWindow *win, uint32_t w, uint32_t h) {
         g.outHeight = h;
         g.swapWinW = w;
         g.swapWinH = h;
+        // Fresh ANativeWindow — its BufferQueue producer slot is empty until
+        // the first ANativeWindow_lock or vkCreateAndroidSurfaceKHR succeeds.
+        // Reset the taint so a new window can take the WSI fast path even if
+        // a previous one was poisoned for CPU.
+        g.windowCpuProducerLocked = false;
         // WSI swapchain is only useful when no CPU-side post-process is
         // running. If NPU or CPU filters are on, they need to read/write the
         // pixels on CPU and the CPU blit path handles that; switching to the

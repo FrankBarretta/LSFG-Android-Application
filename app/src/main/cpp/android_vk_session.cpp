@@ -252,7 +252,11 @@ int create_session(VulkanSession &out) {
                 hasSwapchainDevExt = true;
             }
         } else {
-            LOGW("Optional extension %s not available", opt);
+            // Robustness2 has a dedicated INFO message below explaining the
+            // automatic fallback path; don't double-log it as a warning.
+            if (std::strcmp(opt, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) != 0) {
+                LOGW("Optional extension %s not available", opt);
+            }
         }
     }
     out.hasSwapchain = hasSurfaceExts && hasSwapchainDevExt;
@@ -291,8 +295,14 @@ int create_session(VulkanSession &out) {
     if (!api12 && has_extension(avail, "VK_KHR_vulkan_memory_model"))
         enabledExts.push_back("VK_KHR_vulkan_memory_model");
 
-    if (!out.hasRobustness2)
-        LOGW("VK_EXT_robustness2 absent — framegen will use fallback descriptor image");
+    if (!out.hasRobustness2) {
+        // Mali (most revisions), older Adreno, and PowerVR don't expose
+        // VK_EXT_robustness2. Framegen handles this by binding a tiny 1x1
+        // fallback descriptor image instead of relying on the nullDescriptor
+        // feature — visually identical, ~zero perf cost. This is informational,
+        // not an error.
+        LOGI("VK_EXT_robustness2 absent — using 1x1 fallback descriptor image (no functional impact)");
+    }
 
     // Query optional feature support before requesting them in vkCreateDevice.
     VkPhysicalDeviceVulkanMemoryModelFeaturesKHR memModelQuery{
