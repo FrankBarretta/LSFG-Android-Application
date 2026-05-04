@@ -1,5 +1,6 @@
 #include "lsfg_render_loop.hpp"
 #include "android_vk_session.hpp"
+#include "android_vk_probe.hpp"
 #include "ahb_image_bridge.hpp"
 #include "android_shader_loader.hpp"
 #include "gpu_postprocess.hpp"
@@ -1234,40 +1235,109 @@ bool processRealFrameIntoSlot(const AhbImage &src, const AhbImage &dst) {
 
 bool initFramegen(const char *cacheDir) {
     const std::string cache(cacheDir ? cacheDir : "");
-    // Decide once, before the loader closure captures it: when the user asked
-    // for FP16 *and* the FP16 SPIR-V cache is fully populated, use it. If the
-    // cache is incomplete (older Lossless.dll, partial extraction failure)
-    // fall back to FP32 silently — this matches what the UI capability gate
-    // already advertises but covers the case where the DLL changed between
-    // toggle-on and session start.
-    const bool useFp16 = g.framegenFp16 && fp16_shaders_available(cache);
+
+    // There are three shader sources, in order of preference for a given
+    // session:
+    //
+    //   1. FP16 SPIR-V (Lossless.dll IDs 304..351): user-requested half-precision.
+    //   2. FP32 SPIR-V (Lossless.dll IDs 353..400): default for a normal session.
+    //   3. DXBC translated by dxvk (Lossless.dll IDs 255..302): legacy fallback.
+    //
+    // Why FP32 SPIR-V is the new default instead of the dxvk-translated DXBC:
+    // the bundled dxvk DXBC→SPIR-V compiler (thirdparty/dxbc/src/dxbc/
+    // dxbc_compiler.cpp:34) emits `OpCapability VulkanMemoryModel` on EVERY
+    // shader. That feature is optional in Vulkan 1.2/1.3 and absent on Mali
+    // Bifrost/Valhall (G57/G68/G77) — those drivers silently accept the
+    // request at vkCreateDevice time, then DEVICE_LOST on the first compute
+    // dispatch (see Mali-G57 field log "presentContext threw: Unable to
+    // submit command buffer (error -4)").
+    //
+    // The precompiled FP32 SPIR-V from the DLL uses `OpMemoryModel Logical
+    // GLSL450` with NO VMM capability — verified across the entire 353..400
+    // range via _analysis/dump_fp32_spv.py / _analysis/fp32/. Same shader
+    // outputs as the DXBC path, no Float16 dependency, and bypasses dxvk
+    // entirely. So when both caches are populated, FP32 SPIR-V is strictly a
+    // win: same precision, broader device coverage, no translation step.
+    const bool fp16Available = fp16_shaders_available(cache);
+    const bool fp32SpirvAvailable = fp32_spirv_shaders_available(cache);
+    const bool deviceHasVMM = device_supports_vulkan_memory_model();
+
+    bool useFp16 = g.framegenFp16 && fp16Available;
     if (g.framegenFp16 && !useFp16) {
-        LOGW("FP16 framegen requested but SPIR-V FP16 cache is incomplete in %s — falling back to FP32",
+        LOGW("FP16 framegen requested but SPIR-V FP16 cache is incomplete in %s — falling back",
              cache.c_str());
     }
+
+    // Auto-flip to FP16 when the device can't run the dxvk path AND can't run
+    // the FP32 SPIR-V path either, but FP16 is available. This is the rescue
+    // route for an FP16-only DLL extraction on a Mali device.
+    if (!useFp16 && !fp32SpirvAvailable && fp16Available
+            && device_supports_float16()
+            && !deviceHasVMM) {
+        LOGW("Device lacks vulkanMemoryModel and FP32 SPIR-V cache is missing — "
+             "auto-forcing FP16 framegen path so dxvk is bypassed.");
+        useFp16 = true;
+    }
+
+    // Pick FP32 SPIR-V over DXBC whenever both options exist and the user
+    // hasn't asked for FP16. On VMM-less devices this is mandatory; on devices
+    // that DO support VMM it's still the better default (no dxvk translation
+    // cost at session-start, smaller binary surface, identical shader output).
+    const bool useFp32Spirv = !useFp16 && fp32SpirvAvailable;
     if (useFp16) {
         LOGI("Loading framegen shaders from FP16 SPIR-V cache (Lossless.dll resource IDs 304..351)");
+    } else if (useFp32Spirv) {
+        LOGI("Loading framegen shaders from FP32 SPIR-V cache (Lossless.dll resource IDs 353..400) "
+             "— bypasses dxvk DXBC translator (deviceVMM=%d)", (int)deviceHasVMM);
+    } else {
+        LOGI("Loading framegen shaders from DXBC cache (Lossless.dll resource IDs 255..302) "
+             "— translated via dxvk; requires vulkanMemoryModel (deviceVMM=%d)",
+             (int)deviceHasVMM);
     }
-    auto loader = [cache, useFp16](const std::string &name) -> std::vector<uint8_t> {
+
+    auto loader = [cache, useFp16, useFp32Spirv](const std::string &name) -> std::vector<uint8_t> {
         // Framegen requests shaders by symbolic name (e.g. "p_mipmaps");
-        // we cache them on disk by numeric resource ID. The FP16 path uses a
-        // parallel set of precompiled SPIR-V variants (DXBC_id + 49) stored
-        // under <cache>/fp16/.
-        const uint32_t id = useFp16
-            ? shader_name_to_resource_id_fp16(name)
-            : shader_name_to_resource_id(name);
+        // we cache them on disk by numeric resource ID. Each of the three
+        // sources has its own ID range and on-disk subdirectory, all keyed
+        // off the canonical DXBC id via constant offsets.
+        uint32_t id = 0;
+        ShaderCache source = ShaderCache::Dxbc;
+        if (useFp16) {
+            id = shader_name_to_resource_id_fp16(name);
+            source = ShaderCache::Fp16Spirv;
+        } else if (useFp32Spirv) {
+            id = shader_name_to_resource_id_fp32_spirv(name);
+            source = ShaderCache::Fp32Spirv;
+        } else {
+            id = shader_name_to_resource_id(name);
+            source = ShaderCache::Dxbc;
+        }
         if (id == 0) {
             LOGE("Unknown shader name '%s' from framegen", name.c_str());
             return {};
         }
-        auto spirv = load_cached_spirv(cache, id, useFp16);
-        if (spirv.empty() && useFp16) {
-            // Per-shader fallback: a single missing FP16 blob shouldn't kill
-            // the session — fall back to the FP32 variant for this shader.
-            const uint32_t fp32Id = shader_name_to_resource_id(name);
-            LOGW("FP16 shader '%s' (id %u) missing — falling back to FP32 (id %u)",
-                 name.c_str(), id, fp32Id);
-            spirv = load_cached_spirv(cache, fp32Id, /*useFp16=*/false);
+        auto spirv = load_cached_spirv(cache, id, source);
+
+        // Per-shader fallback chain: FP16 → FP32 SPIR-V → DXBC. A single
+        // missing blob shouldn't kill the session if a lower-tier cache can
+        // serve it. Skipping a missing FP32 SPIR-V → DXBC also means the
+        // device must support VMM for that one shader to dispatch — that's
+        // correct: if the FP32 cache was complete we wouldn't be here.
+        if (spirv.empty() && source == ShaderCache::Fp16Spirv) {
+            const uint32_t fp32Id = shader_name_to_resource_id_fp32_spirv(name);
+            if (fp32Id != 0) {
+                LOGW("FP16 shader '%s' (id %u) missing — falling back to FP32 SPIR-V (id %u)",
+                     name.c_str(), id, fp32Id);
+                spirv = load_cached_spirv(cache, fp32Id, ShaderCache::Fp32Spirv);
+            }
+        }
+        if (spirv.empty() && (source == ShaderCache::Fp16Spirv || source == ShaderCache::Fp32Spirv)) {
+            const uint32_t dxbcId = shader_name_to_resource_id(name);
+            if (dxbcId != 0) {
+                LOGW("SPIR-V shader '%s' (id %u) missing — falling back to DXBC (id %u)",
+                     name.c_str(), id, dxbcId);
+                spirv = load_cached_spirv(cache, dxbcId, ShaderCache::Dxbc);
+            }
         }
         if (spirv.empty()) {
             LOGE("Shader '%s' (id %u) missing from cache (%s)",
@@ -1471,14 +1541,33 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
     // Feedback-loop gate: if setSkipScreenshot failed, MediaProjection captures
     // our overlay (opaque dark) instead of the game, locking avgLuma near zero.
     // Keep the overlay transparent (skip the blit) until a bright frame proves
-    // we are seeing real game content — the gate never force-opens, because a
-    // forced open on dark input re-establishes the feedback loop immediately.
-    // Once a bright frame (luma >= 30) arrives the gate latches open for the
-    // session so dark in-game scenes (fade-to-black, cutscenes) still get LSFG.
+    // we are seeing real game content. Once luma>=18 arrives the gate latches
+    // open for the session so dark in-game scenes (fade-to-black, cutscenes,
+    // night-mode camera apps) still get LSFG.
+    //
+    // The threshold was originally 30 — that's too tight for camera/photography
+    // apps and dark games (e.g. com.ktzevani.nativecameravulkan averages ~25-29
+    // on real content), causing the user to see ~1s of black overlay before the
+    // gate opens. A real feedback loop pins luma to 0-5; anything above ~10 is
+    // already dim-but-real game content and safe to forward. 18 is a comfortable
+    // safety margin that still rejects the dark feedback signal.
+    //
+    // Additionally: force-open after 120 consecutive dark frames (~2s) regardless
+    // of luma. If the user's screenshot exclusion is broken AND the game is
+    // genuinely dark, holding the overlay transparent forever is worse than a
+    // brief feedback flash that lets them see the game and toggle the overlay
+    // off. Without this escape hatch, very dark legitimate content (true
+    // black-on-black scenes) would wedge the overlay forever.
+    constexpr uint32_t kLumaGateOpenThreshold = 18;
+    constexpr uint32_t kLumaGateForceOpenAfter = 120;
     if (!g.lumaGateOpen) {
-        if (avgLuma >= 30u) {
+        if (avgLuma >= kLumaGateOpenThreshold) {
             g.lumaGateOpen = true;
             LOGI("blitOutputToWindow: luma gate opened after %u dark frames (luma=%u)",
+                 g.lumaGateDarkCount, avgLuma);
+        } else if (g.lumaGateDarkCount >= kLumaGateForceOpenAfter) {
+            g.lumaGateOpen = true;
+            LOGW("blitOutputToWindow: luma gate force-opened after %u dark frames (luma=%u) — content may be very dim or feedback loop",
                  g.lumaGateDarkCount, avgLuma);
         } else {
             ++g.lumaGateDarkCount;
@@ -1816,6 +1905,15 @@ void workerThread() {
             else                   LSFG_3_1::waitIdle();
             // PROFILE: cross-device sync complete; outputs ready to read.
             const auto tWaitIdleDone = State::Clock::now();
+
+            // Note: a previous revision auto-disabled framegen here when the
+            // GPU pipeline was slower than the source cadence. Removed by
+            // design — if the user picks heavy settings (flowScale=1.0 +
+            // high multiplier on a weak device) it's their call to live with
+            // the resulting frame rate. Silently flipping to passthrough
+            // looked like a bug ("framegen stopped after 5s"). The bottom-of-
+            // pipeline DEVICE_LOST fallback in presentContext above still
+            // protects against unrecoverable driver errors.
             // Accumulator for the actual time spent inside blitOutputToWindow
             // calls — excludes pacing sleep_until() time, which is idle, not
             // work. Reset each iteration; consumed by the profile logger below.
@@ -2032,13 +2130,15 @@ void workerThread() {
             prof.samples++;
             if (prof.samples >= kProfileWindow) {
                 const double n = static_cast<double>(prof.samples);
+                const double avgWaitIdleMs = (prof.waitIdleNs / n) / 1'000'000.0;
+                const double avgWallEndMs  = (prof.totalNs    / n) / 1'000'000.0;
                 LOGI("frame profile (avg over %u): copy=%.2fms present=%.2fms waitIdle=%.2fms blitWork=%.2fms wallEnd=%.2fms (mult=%d outputs=%zu)",
                      prof.samples,
                      (prof.copyNs / n)     / 1'000'000.0,
                      (prof.presentNs / n)  / 1'000'000.0,
-                     (prof.waitIdleNs / n) / 1'000'000.0,
+                     avgWaitIdleMs,
                      (prof.blitNs / n)     / 1'000'000.0,
-                     (prof.totalNs / n)    / 1'000'000.0,
+                     avgWallEndMs,
                      g.multiplier, g.outputs.size());
                 // Publish the closed window so the benchmark JNI getter can
                 // surface segment averages without scraping logcat.

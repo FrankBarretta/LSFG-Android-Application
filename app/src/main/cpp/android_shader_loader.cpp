@@ -51,6 +51,12 @@ constexpr uint32_t kResourceIds[] = {
 // patches/LosslessScaling/findings.md for the full mapping table.
 constexpr uint32_t kFp16IdOffset = 49;
 
+// FP32 SPIR-V variants live as RCDATA at DXBC_id + 98 (range 353..400).
+// Same shaders, no Float16 capability, MemoryModel Logical GLSL450 (no
+// VulkanMemoryModel) — verified in _analysis/fp32/ via dump_fp32_spv.py.
+// Preferred over the DXBC translator path on devices without vulkanMemoryModel.
+constexpr uint32_t kFp32SpirvIdOffset = 98;
+
 // SPIR-V LE magic word (0x07230203). Used to validate FP16 blobs before
 // caching them — if THS reshuffles resource layout in a future Lossless.dll
 // update, IDs 304..351 may stop being SPIR-V; we silently skip those instead
@@ -403,16 +409,67 @@ int extract_dll_to_spirv(const std::string &dllPath, const std::string &cacheDir
         ++fp16Cached;
     }
     LOGI("FP16 SPIR-V variants: %d cached, %d skipped (%s)", fp16Cached, fp16Skipped, fp16Dir.c_str());
+
+    // FP32 SPIR-V variants: precompiled in the DLL at DXBC_id + 98 (range
+    // 353..400). Same shape as the FP16 cache step above, including the
+    // dense-binding rewrite — these blobs ship with HLSL register slots like
+    // the FP16 set, so they need the same flatten before the framegen
+    // descriptor-set layout will accept them. Best-effort: a missing FP32
+    // SPIR-V set falls back to the (already populated) DXBC cache.
+    const std::string fp32Dir = cacheDir + "/fp32";
+    if (mkdir(fp32Dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        LOGE("Failed to create FP32 SPIR-V cache dir %s (errno=%d) — FP32 SPIR-V path disabled",
+             fp32Dir.c_str(), errno);
+        return kOk;
+    }
+    int fp32SpvCached = 0;
+    int fp32SpvSkipped = 0;
+    for (uint32_t dxbcId : kResourceIds) {
+        const uint32_t fp32Id = dxbcId + kFp32SpirvIdOffset;
+        const auto it = blobsByResId.find(fp32Id);
+        if (it == blobsByResId.end()) {
+            ++fp32SpvSkipped;
+            continue;
+        }
+        std::vector<uint8_t> blob = it->second;
+        if (blob.size() < kSpirvMagic.size() ||
+            !std::equal(kSpirvMagic.begin(), kSpirvMagic.end(), blob.begin())) {
+            ++fp32SpvSkipped;
+            continue;
+        }
+        if (!rewrite_spirv_bindings_dense(blob)) {
+            LOGE("FP32 SPIR-V binding rewrite failed for resource %u — skipping", fp32Id);
+            ++fp32SpvSkipped;
+            continue;
+        }
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%u.spv", fp32Dir.c_str(), fp32Id);
+        if (!write_file(path, blob)) {
+            LOGE("Failed to write FP32 SPIR-V cache %s — FP32 SPIR-V path may be incomplete", path);
+            ++fp32SpvSkipped;
+            continue;
+        }
+        ++fp32SpvCached;
+    }
+    LOGI("FP32 SPIR-V variants: %d cached, %d skipped (%s)",
+         fp32SpvCached, fp32SpvSkipped, fp32Dir.c_str());
     return kOk;
 }
 
 std::vector<uint8_t> load_cached_spirv(const std::string &cacheDir, uint32_t resId,
-                                       bool useFp16) {
+                                       ShaderCache source) {
     char path[512];
-    if (useFp16) {
-        std::snprintf(path, sizeof(path), "%s/fp16/%u.spv", cacheDir.c_str(), resId);
-    } else {
-        std::snprintf(path, sizeof(path), "%s/%u.spv", cacheDir.c_str(), resId);
+    switch (source) {
+        case ShaderCache::Fp16Spirv:
+            std::snprintf(path, sizeof(path), "%s/fp16/%u.spv", cacheDir.c_str(), resId);
+            break;
+        case ShaderCache::Fp32Spirv:
+            std::snprintf(path, sizeof(path), "%s/fp32/%u.spv", cacheDir.c_str(), resId);
+            break;
+        case ShaderCache::Dxbc:
+        default:
+            std::snprintf(path, sizeof(path), "%s/%u.spv", cacheDir.c_str(), resId);
+            break;
     }
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -514,6 +571,32 @@ bool fp16_shaders_available(const std::string &cacheDir) {
         if (fp16Id < 304 || fp16Id > 351) continue;
         char path[512];
         std::snprintf(path, sizeof(path), "%s/fp16/%u.spv", cacheDir.c_str(), fp16Id);
+        struct stat st{};
+        if (stat(path, &st) != 0 || st.st_size < 20) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t shader_name_to_resource_id_fp32_spirv(const std::string &name) {
+    const uint32_t dxbcId = shader_name_to_resource_id(name);
+    if (dxbcId == 0) {
+        return 0;
+    }
+    const uint32_t fp32Id = dxbcId + kFp32SpirvIdOffset;
+    if (fp32Id < 353 || fp32Id > 400) {
+        return 0;
+    }
+    return fp32Id;
+}
+
+bool fp32_spirv_shaders_available(const std::string &cacheDir) {
+    for (uint32_t dxbcId : kResourceIds) {
+        const uint32_t fp32Id = dxbcId + kFp32SpirvIdOffset;
+        if (fp32Id < 353 || fp32Id > 400) continue;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/fp32/%u.spv", cacheDir.c_str(), fp32Id);
         struct stat st{};
         if (stat(path, &st) != 0 || st.st_size < 20) {
             return false;

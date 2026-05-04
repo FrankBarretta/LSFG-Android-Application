@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -231,6 +232,79 @@ bool device_supports_float16() {
         if (fp16.shaderFloat16 == VK_TRUE) {
             ok = true;
             break;
+        }
+    }
+    vkDestroyInstance(instance, nullptr);
+    return ok;
+}
+
+bool device_supports_vulkan_memory_model() {
+    // VulkanMemoryModel is core-promoted in 1.2 (queryable via
+    // VkPhysicalDeviceVulkan12Features); on 1.1 it's gated by
+    // VK_KHR_vulkan_memory_model. We accept either signal — both gate the same
+    // OpCapability VulkanMemoryModel that the bundled DXBC translator emits.
+    if (volkInitialize() != VK_SUCCESS) {
+        return false;
+    }
+    const VkApplicationInfo appInfo{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "lsfg-android",
+        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+        .pEngineName = "lsfg-vk",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_2,
+    };
+    const VkInstanceCreateInfo instInfo{
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &appInfo,
+    };
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&instInfo, nullptr, &instance) != VK_SUCCESS) {
+        return false;
+    }
+    volkLoadInstance(instance);
+
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (count == 0) {
+        vkDestroyInstance(instance, nullptr);
+        return false;
+    }
+    std::vector<VkPhysicalDevice> phys(count);
+    vkEnumeratePhysicalDevices(instance, &count, phys.data());
+
+    bool ok = false;
+    for (auto pd : phys) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(pd, &props);
+        const bool api12 = props.apiVersion >= VK_API_VERSION_1_2;
+        if (api12) {
+            VkPhysicalDeviceVulkan12Features vk12{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+            };
+            VkPhysicalDeviceFeatures2 feats2{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                .pNext = &vk12,
+            };
+            vkGetPhysicalDeviceFeatures2(pd, &feats2);
+            if (vk12.vulkanMemoryModel == VK_TRUE) {
+                ok = true;
+                break;
+            }
+        } else {
+            // Pre-1.2: VK_KHR_vulkan_memory_model presence is the gating signal.
+            uint32_t extCount = 0;
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, nullptr);
+            std::vector<VkExtensionProperties> exts(extCount);
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, exts.data());
+            for (const auto &e : exts) {
+                if (std::strcmp(e.extensionName,
+                                VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME) == 0) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (ok) break;
         }
     }
     vkDestroyInstance(instance, nullptr);

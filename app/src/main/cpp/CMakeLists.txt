@@ -42,7 +42,27 @@ add_subdirectory("${LSFG_ROOT}/thirdparty/dxbc" "${CMAKE_BINARY_DIR}/dxbc" EXCLU
 
 # -----------------------------------------------------------------------------
 # framegen — the Vulkan frame-generation pipeline. Reused verbatim.
+#
+# Tell Gradle's externalNativeBuild task that this project's "input set"
+# extends into the submodule sources. Without this, AGP's incremental build
+# only watches files under app/src/main/cpp/ and silently skips re-running
+# CMake when files in ../../../../../lsfg-vk-android/framegen/src change —
+# leaving the cached lsfg-vk-framegen.a in place even after a real source
+# edit. CMAKE_CONFIGURE_DEPENDS makes the configure step depend on every
+# .cpp/.hpp under the framegen tree, so any edit there triggers a full
+# regeneration on the next build.
 # -----------------------------------------------------------------------------
+file(GLOB_RECURSE FRAMEGEN_WATCH_SOURCES CONFIGURE_DEPENDS
+    "${LSFG_ROOT}/framegen/src/*.cpp"
+    "${LSFG_ROOT}/framegen/src/*.hpp"
+    "${LSFG_ROOT}/framegen/include/*.hpp"
+    "${LSFG_ROOT}/framegen/public/*.hpp"
+    "${LSFG_ROOT}/framegen/v3.1_src/*.cpp"
+    "${LSFG_ROOT}/framegen/v3.1p_src/*.cpp"
+)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${FRAMEGEN_WATCH_SOURCES}
+)
 add_subdirectory("${LSFG_ROOT}/framegen" "${CMAKE_BINARY_DIR}/framegen" EXCLUDE_FROM_ALL)
 
 # -----------------------------------------------------------------------------
