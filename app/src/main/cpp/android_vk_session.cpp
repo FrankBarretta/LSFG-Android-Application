@@ -180,10 +180,23 @@ int create_session(VulkanSession &out) {
     if (hasSurfaceExts) {
         out.pfnCreateAndroidSurfaceKHR = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
             vkGetInstanceProcAddr(out.instance, "vkCreateAndroidSurfaceKHR"));
-        if (out.pfnCreateAndroidSurfaceKHR != nullptr) {
-            LOGI("vkCreateAndroidSurfaceKHR resolved and cached on session");
+        out.pfnDestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+            vkGetInstanceProcAddr(out.instance, "vkDestroySurfaceKHR"));
+        out.pfnGetPhysicalDeviceSurfaceCapabilitiesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+            vkGetInstanceProcAddr(out.instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+        out.pfnGetPhysicalDeviceSurfaceFormatsKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+            vkGetInstanceProcAddr(out.instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+        out.pfnGetPhysicalDeviceSurfaceSupportKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(
+            vkGetInstanceProcAddr(out.instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+
+        if (out.pfnCreateAndroidSurfaceKHR != nullptr &&
+            out.pfnDestroySurfaceKHR != nullptr &&
+            out.pfnGetPhysicalDeviceSurfaceCapabilitiesKHR != nullptr &&
+            out.pfnGetPhysicalDeviceSurfaceFormatsKHR != nullptr &&
+            out.pfnGetPhysicalDeviceSurfaceSupportKHR != nullptr) {
+            LOGI("vkCreateAndroidSurfaceKHR and related WSI functions resolved and cached on session");
         } else {
-            LOGW("vkCreateAndroidSurfaceKHR unresolvable on this driver — disabling WSI");
+            LOGW("WSI surface functions unresolvable on this driver — disabling WSI");
             hasSurfaceExts = false;
         }
     }

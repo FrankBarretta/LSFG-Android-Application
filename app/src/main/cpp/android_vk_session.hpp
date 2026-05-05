@@ -66,6 +66,11 @@ struct VulkanSession {
     // here at session-init time and use it from the render loop instead of
     // the volk global.
     PFN_vkCreateAndroidSurfaceKHR pfnCreateAndroidSurfaceKHR = nullptr;
+    PFN_vkDestroySurfaceKHR pfnDestroySurfaceKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR pfnGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR pfnGetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR pfnGetPhysicalDeviceSurfaceSupportKHR = nullptr;
+
 
     // Device UUID packed the way framegen expects: vendorID<<32 | deviceID.
     // Pass this to LSFG_3_1::initialize.

@@ -531,7 +531,11 @@ void destroySwapchain() {
     if (g.swap.surface != VK_NULL_HANDLE && g.vk.instance != VK_NULL_HANDLE) {
         // Surface destruction uses the instance-level function. volk populates
         // it globally after volkLoadInstance.
-        vkDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        if (g.vk.pfnDestroySurfaceKHR != nullptr) {
+            g.vk.pfnDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        } else {
+            vkDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        }
         g.swap.surface = VK_NULL_HANDLE;
     }
     g.swap.extent = {0, 0};
@@ -604,7 +608,7 @@ bool createSwapchain() {
 
     // Can our compute queue actually present on this surface?
     VkBool32 canPresent = VK_FALSE;
-    const VkResult suppr = vkGetPhysicalDeviceSurfaceSupportKHR(g.vk.physicalDevice,
+    const VkResult suppr = g.vk.pfnGetPhysicalDeviceSurfaceSupportKHR(g.vk.physicalDevice,
             g.vk.computeFamilyIdx, g.swap.surface, &canPresent);
     LOGI("createSwapchain: surfaceSupport rc=%d canPresent=%d", (int)suppr, (int)canPresent);
     if (suppr != VK_SUCCESS || canPresent != VK_TRUE) {
@@ -615,7 +619,7 @@ bool createSwapchain() {
     }
 
     VkSurfaceCapabilitiesKHR caps{};
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.vk.physicalDevice,
+    if (g.vk.pfnGetPhysicalDeviceSurfaceCapabilitiesKHR(g.vk.physicalDevice,
             g.swap.surface, &caps) != VK_SUCCESS) {
         LOGW("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed");
         destroySwapchain();
@@ -625,11 +629,11 @@ bool createSwapchain() {
     // Format: prefer RGBA8 UNORM since that's what framegen outputs. Fall back
     // to whatever the driver offers if not present.
     uint32_t fmtCount = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
+    g.vk.pfnGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
                                          &fmtCount, nullptr);
     std::vector<VkSurfaceFormatKHR> fmts(fmtCount);
     if (fmtCount > 0) {
-        vkGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
+        g.vk.pfnGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
                                              &fmtCount, fmts.data());
     }
     VkSurfaceFormatKHR chosen{VK_FORMAT_R8G8B8A8_UNORM, VK_COLORSPACE_SRGB_NONLINEAR_KHR};
@@ -747,11 +751,14 @@ bool createSwapchain() {
 // Returns true on success. On VK_ERROR_OUT_OF_DATE_KHR or _SUBOPTIMAL_KHR the
 // swapchain is marked dirty; the caller's next blit will recreate it.
 bool blitOutputToSwapchain(const AhbImage &src) {
+    // Note: Called with g.mu held from blitOutputToWindow.
     if (g.swap.swapchain == VK_NULL_HANDLE) return false;
     if (src.image == VK_NULL_HANDLE) return false;
     if (g.swap.outOfDate) {
         if (!createSwapchain()) return false;
     }
+
+    if (g.swap.acquireSems.empty()) return false;
 
     // Pick an acquire semaphore from the round-robin pool. Using a single
     // semaphore risks "semaphore already has a pending wait" on fast backs.
@@ -768,6 +775,11 @@ bool blitOutputToSwapchain(const AhbImage &src) {
     }
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
         LOGW("vkAcquireNextImageKHR returned %d", (int)ar);
+        return false;
+    }
+
+    if (imageIdx >= g.swap.images.size()) {
+        LOGW("vkAcquireNextImageKHR returned OOB index %u (size %zu)", imageIdx, g.swap.images.size());
         return false;
     }
 
@@ -1447,6 +1459,7 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
     const bool cpuPostActive = g.npuPostProcessing || g.cpuPostProcessing;
     if (kEnableWsiSwapchain && !cpuPostActive && g.vk.hasSwapchain
             && !g.swap.disabledForSession) {
+        std::lock_guard<std::mutex> lock(g.mu);
         if (g.swap.swapchain == VK_NULL_HANDLE) {
             if (!createSwapchain()) {
                 // Mark disabled so subsequent blits don't spin on the
@@ -1710,25 +1723,12 @@ void workerThread() {
     // so a prior session that crashed or left dark content would be visible to
     // MediaProjection immediately, seeding a dark-feedback loop on the very
     // first captured frame.
-    if (g.outWindow != nullptr) {
-        ANativeWindow_setBuffersGeometry(g.outWindow,
-            static_cast<int32_t>(g.outWidth),
-            static_cast<int32_t>(g.outHeight),
-            WINDOW_FORMAT_RGBA_8888);
-        ANativeWindow_Buffer clearBuf{};
-        if (ANativeWindow_lock(g.outWindow, &clearBuf, nullptr) == 0) {
-            memset(clearBuf.bits, 0,
-                   static_cast<size_t>(clearBuf.stride) *
-                   static_cast<size_t>(clearBuf.height) * 4);
-            ANativeWindow_unlockAndPost(g.outWindow);
-            // The BufferQueue is now bound to a CPU producer for this window.
-            // Any later createSwapchain attempt would fail with
-            // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR — pre-pin the taint so we
-            // don't even try (see createSwapchain for rationale).
-            g.windowCpuProducerLocked = true;
-            LOGI("workerThread: cleared overlay to transparent");
-        }
-    }
+    // Skip CPU clearing here if we want to use the Vulkan swapchain path.
+    // Vulkan will clear the screen much more efficiently when it starts.
+    // If we were to call ANativeWindow_lock() here, the window would be
+    // "poisoned" for the rest of the session, forcing us into the slow
+    // CPU blit fallback.
+
 
     // Drain any frames that were buffered during shader compilation.  Those
     // frames were captured while the overlay may have been dark (stale content
@@ -2317,9 +2317,12 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
         g.framegenCtxId = -1;
     }
 
+    g.initialized = true;
+
+
+
     g.stopRequested = false;
     g.worker = std::thread(workerThread);
-    g.initialized = true;
     // Do NOT build the swapchain here. At initContext time the overlay's
     // Surface is still owned by the mirror VirtualDisplay producer — it's
     // only detached when setLsfgMode() runs (which retargets the VD to the
