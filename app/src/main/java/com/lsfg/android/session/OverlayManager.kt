@@ -2,17 +2,16 @@ package com.lsfg.android.session
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.PixelFormat
 import android.graphics.Region
-import android.graphics.SurfaceTexture
 import android.os.Build
 import android.util.DisplayMetrics
 import android.util.Log
-import android.view.Choreographer
+import android.view.AttachedSurfaceControl
 import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceControl
-import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -23,25 +22,14 @@ import com.lsfg.android.prefs.LsfgPreferences
 import com.lsfg.android.prefs.VsyncRefreshOverride
 
 /**
- * Full-screen overlay that hosts a [TextureView] for the mirrored / LSFG-processed
- * frames.
+ * Full-screen overlay that hosts a manually-managed SurfaceControl video layer for
+ * LSFG-processed frames, while keeping HUD and input semantics in the normal View
+ * hierarchy.
  *
- * **Why TextureView instead of SurfaceView**: a SurfaceView creates a child BLAST
- * SurfaceControl that lives outside the parent window's surface hierarchy. On strict
- * AOSP builds (e.g. Rockchip Orange Pi 5 Ultra, Android 13) InputDispatcher's
- * BLOCK_UNTRUSTED_TOUCHES filter evaluates that BLAST surface independently, sees
- * an opaque (alpha=1.0) untrusted overlay sitting over the target app, and drops
- * every tap with `Dropping untrusted touch event due to /<uid>` — even when the
- * parent window has an empty touchable region and is itself trusted. The
- * "trusted" bit does NOT propagate to the child SurfaceControl, and the only API
- * to mark it trusted (`SurfaceControl.Transaction.setTrustedOverlay`) is hidden /
- * blocklisted on user builds.
- *
- * TextureView draws into the parent View's hardware layer instead of creating a
- * separate SurfaceControl, so InputDispatcher only sees one window — the parent
- * one, whose touchable region we already publish as empty. The cost is one extra
- * GPU copy per frame relative to SurfaceView; acceptable here because the
- * native render loop already CPU-blits each generated frame to ANativeWindow.
+ * The video layer must remain Vulkan's first and only producer to make Android WSI
+ * work reliably. Keeping it out of TextureView / SurfaceView avoids BufferQueue
+ * producer ownership conflicts that surface as
+ * VK_ERROR_NATIVE_WINDOW_IN_USE_KHR during vkCreateAndroidSurfaceKHR.
  *
  * Surface lifecycle is event-driven: consumers get [onSurfaceReady] every time a
  * new Surface becomes valid (initial show and every recreation after orientation
@@ -53,9 +41,11 @@ import com.lsfg.android.prefs.VsyncRefreshOverride
 class OverlayManager(private val ctx: Context) {
 
     private var root: FrameLayout? = null
-    private var textureView: TextureView? = null
     private var producerSurface: Surface? = null
+    private var videoLayerControl: SurfaceControl? = null
+    private var rootAttachedSurfaceControl: AttachedSurfaceControl? = null
     private var hostWindowManager: WindowManager? = null
+    private var pendingVideoLayerAttach: Runnable? = null
     private var fpsView: TextView? = null
     private var graphView: FrameGraphView? = null
     private var benchmarkPanel: LinearLayout? = null
@@ -63,8 +53,7 @@ class OverlayManager(private val ctx: Context) {
     private var benchmarkBar: ProgressBar? = null
     private var insetsListener: Any? = null
     private var internalInsetsListener: Any? = null
-    private var frameLoopCallback: Choreographer.FrameCallback? = null
-    private var surfaceTextureUpdateCount = 0
+    private var lastDisplayRotation: Int = Surface.ROTATION_0
 
     @Volatile
     private var surfaceReadyListener: ((Surface, Int, Int) -> Unit)? = null
@@ -74,6 +63,8 @@ class OverlayManager(private val ctx: Context) {
     private var requestedRefreshRateHz: Float = 0f
     private var overlayWidth: Int = 0
     private var overlayHeight: Int = 0
+
+    private data class BufferSize(val width: Int, val height: Int)
 
     /** Callback invoked every time the overlay Surface becomes valid for writing. */
     fun onSurfaceReady(cb: (Surface, Int, Int) -> Unit) {
@@ -143,6 +134,8 @@ class OverlayManager(private val ctx: Context) {
         val screenH = metrics.heightPixels
         overlayWidth = screenW
         overlayHeight = screenH
+        @Suppress("DEPRECATION")
+        lastDisplayRotation = wm.defaultDisplay.rotation
         Log.i(TAG, "Showing overlay at ${screenW}x${screenH} targetRefresh=${requestedRefreshRateHz}Hz")
 
         val layoutType = when {
@@ -203,83 +196,8 @@ class OverlayManager(private val ctx: Context) {
             }
         }
 
-        // FrameLayout background stays transparent — TextureView composites into
-        // its parent's hardware layer, but we still want no opaque fill behind it
-        // before the first frame arrives so the loading status text remains
-        // visible against the underlying app instead of a black slab.
         val layout = FrameLayout(ctx)
-        val tex = TextureView(ctx)
-        // Must be false: isOpaque=true signals the hardware composer that the
-        // layer is always opaque, causing HWC to skip compositing underlying
-        // layers (the game) for VirtualDisplay/MediaProjection output.  With
-        // opaque=true, even an alpha=0 cleared surface appears as opaque black
-        // in the capture feed, seeding the dark feedback loop.  false lets the
-        // compositor see through transparent pixels to the game content.
-        tex.isOpaque = false
-        tex.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                // Re-apply skip-screenshot now that the window's SurfaceControl is
-                // guaranteed to have a valid native handle. The call in show() fires
-                // immediately after wm.addView(), where isAttachedToWindow is already
-                // true (ViewRootImpl.setView dispatches attachment synchronously) but
-                // the SurfaceControl native handle is only assigned later during
-                // relayoutWindow() — which completes before the first onSurfaceTextureAvailable.
-                installSkipScreenshot(layout)
-
-                // Pin the producer-side buffer size to the physical screen so the
-                // VirtualDisplay's frames don't get scaled by the consumer.
-                st.setDefaultBufferSize(screenW, screenH)
-                val s = Surface(st)
-                producerSurface = s
-                syncOverlayGeometry()
-                requestMaxRefreshRate(s)
-                Log.i(TAG, "TextureView surface available ${width}x${height} valid=${s.isValid} hwAccel=${tex.isHardwareAccelerated}")
-                if (s.isValid) {
-                    surfaceReadyListener?.invoke(s, overlayWidth, overlayHeight)
-                }
-                // Drive TextureView redraws explicitly via Choreographer. On some
-                // devices (MediaTek/Mali) the TextureView-internal onFrameAvailable
-                // → scheduleTraversals path silently stops after the first buffer,
-                // leaving the overlay frozen on frame 1. Calling invalidate() on
-                // every VSYNC ensures updateTexImage() is called whenever a new
-                // buffer is available, regardless of the internal mechanism.
-                surfaceTextureUpdateCount = 0
-                startFrameLoop(tex)
-            }
-
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                st.setDefaultBufferSize(screenW, screenH)
-                val s = producerSurface
-                syncOverlayGeometry()
-                if (s != null) {
-                    requestMaxRefreshRate(s)
-                    Log.i(TAG, "TextureView size changed ${width}x${height}")
-                    if (s.isValid) {
-                        surfaceReadyListener?.invoke(s, overlayWidth, overlayHeight)
-                    }
-                }
-            }
-
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                Log.i(TAG, "TextureView surface destroyed")
-                stopFrameLoop()
-                surfaceLostListener?.invoke()
-                runCatching { producerSurface?.release() }
-                producerSurface = null
-                // Returning true tells TextureView it can release the SurfaceTexture
-                // immediately; we have no off-thread producer holding a reference
-                // beyond the native render loop, which has already been notified
-                // via surfaceLostListener and detaches before this returns.
-                return true
-            }
-
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
-                val n = ++surfaceTextureUpdateCount
-                if (n <= 30 || n % 60 == 0) {
-                    Log.d(TAG, "onSurfaceTextureUpdated #$n")
-                }
-            }
-        }
+        layout.setBackgroundColor(Color.TRANSPARENT)
         val fps = TextView(ctx).apply {
             text = ""
             setTextColor(Color.WHITE)
@@ -288,13 +206,6 @@ class OverlayManager(private val ctx: Context) {
             setPadding(16, 8, 16, 8)
             visibility = View.GONE
         }
-        layout.addView(
-            tex,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
         layout.addView(
             fps,
             FrameLayout.LayoutParams(
@@ -377,6 +288,16 @@ class OverlayManager(private val ctx: Context) {
         )
 
         wm.addView(layout, params)
+        Log.i(TAG, "show: addView completed hostView=${layout.javaClass.simpleName}@${Integer.toHexString(System.identityHashCode(layout))}")
+
+        // The view window hosts HUD + input semantics; the actual video output uses a
+        // dedicated child SurfaceControl so Vulkan can be its first/only producer.
+        val bufferSize = currentBufferSize()
+        Log.i(
+            TAG,
+            "Initial video buffer ${bufferSize.width}x${bufferSize.height} displayRotation=$lastDisplayRotation",
+        )
+        scheduleVideoLayerAttach(layout, bufferSize.width, bufferSize.height)
 
         // Mark the overlay's SurfaceControl with skipScreenshot so SurfaceFlinger
         // excludes it from virtual-display composition (MediaProjection) while still
@@ -404,7 +325,6 @@ class OverlayManager(private val ctx: Context) {
         benchmarkPanel = benchPanel
         benchmarkLabel = benchLabel
         benchmarkBar = benchBar
-        textureView = tex
     }
 
     /**
@@ -507,16 +427,18 @@ class OverlayManager(private val ctx: Context) {
             runCatching { wm.removeView(r) }
         }
         runCatching { NativeBridge.setVsyncPeriodNs(0L) }
-        runCatching { producerSurface?.release() }
+        pendingVideoLayerAttach?.let { r.removeCallbacks(it) }
+        pendingVideoLayerAttach = null
+        destroyVideoLayer()
         producerSurface = null
         root = null
-        textureView = null
         fpsView = null
         graphView = null
         benchmarkPanel = null
         benchmarkLabel = null
         benchmarkBar = null
         hostWindowManager = null
+        rootAttachedSurfaceControl = null
     }
 
     /**
@@ -652,10 +574,13 @@ class OverlayManager(private val ctx: Context) {
         wm.defaultDisplay.getRealMetrics(metrics)
         val newW = metrics.widthPixels
         val newH = metrics.heightPixels
-        if (newW == overlayWidth && newH == overlayHeight) return
+        @Suppress("DEPRECATION")
+        val newRotation = wm.defaultDisplay.rotation
+        if (newW == overlayWidth && newH == overlayHeight && newRotation == lastDisplayRotation) return
 
         overlayWidth = newW
         overlayHeight = newH
+        lastDisplayRotation = newRotation
 
         val lp = r.layoutParams as? WindowManager.LayoutParams
         if (lp != null) {
@@ -664,9 +589,221 @@ class OverlayManager(private val ctx: Context) {
             runCatching { wm.updateViewLayout(r, lp) }
                 .onFailure { Log.w(TAG, "updateViewLayout(${newW}x${newH}) failed", it) }
         }
-        runCatching { textureView?.surfaceTexture?.setDefaultBufferSize(newW, newH) }
-            .onFailure { Log.w(TAG, "setDefaultBufferSize(${newW}x${newH}) failed", it) }
-        Log.i(TAG, "Overlay geometry synced to ${newW}x${newH}")
+        val bufferSize = currentBufferSize()
+        updateVideoLayerGeometry(bufferSize.width, bufferSize.height)
+        Log.i(
+            TAG,
+            "Overlay geometry synced to ${newW}x${newH} rotation=$newRotation videoBuffer=${bufferSize.width}x${bufferSize.height}",
+        )
+    }
+
+    private fun currentBufferSize(): BufferSize =
+        if (lastDisplayRotation == Surface.ROTATION_90 || lastDisplayRotation == Surface.ROTATION_270) {
+            BufferSize(overlayHeight, overlayWidth)
+        } else {
+            BufferSize(overlayWidth, overlayHeight)
+        }
+
+    private fun applyVideoLayerTransform(
+        txn: SurfaceControl.Transaction,
+        sc: SurfaceControl,
+        width: Int,
+        height: Int,
+    ) {
+        txn.setBufferSize(sc, width, height)
+        txn.setCrop(sc, Rect(0, 0, width, height))
+        val matrix = when (lastDisplayRotation) {
+            Surface.ROTATION_90 -> floatArrayOf(0f, 1f, -1f, 0f, 0f, overlayHeight.toFloat())
+            Surface.ROTATION_180 -> floatArrayOf(-1f, 0f, 0f, -1f, overlayWidth.toFloat(), overlayHeight.toFloat())
+            Surface.ROTATION_270 -> floatArrayOf(0f, -1f, 1f, 0f, overlayWidth.toFloat(), 0f)
+            else -> floatArrayOf(1f, 0f, 0f, 1f, 0f, 0f)
+        }
+        val dsdx = matrix[0]
+        val dtdx = matrix[1]
+        val dtdy = matrix[2]
+        val dsdy = matrix[3]
+        val posX = matrix[4]
+        val posY = matrix[5]
+        runCatching {
+            val method = txn.javaClass.getMethod(
+                "setMatrix",
+                SurfaceControl::class.java,
+                Float::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType,
+            )
+            method.invoke(txn, sc, dsdx, dtdx, dtdy, dsdy)
+        }.onFailure { Log.w(TAG, "setMatrix failed", it) }
+        txn.setPosition(sc, posX, posY)
+        Log.i(
+            TAG,
+            "Video layer matrix applied rotation=$lastDisplayRotation overlay=${overlayWidth}x${overlayHeight} buffer=${width}x${height}",
+        )
+    }
+
+    private fun getAttachedSurfaceControl(host: View): AttachedSurfaceControl? {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                host.rootSurfaceControl
+            } else {
+                host.javaClass.getMethod("getRootSurfaceControl").invoke(host) as? AttachedSurfaceControl
+            }
+        }.onSuccess {
+            Log.i(
+                TAG,
+                "getAttachedSurfaceControl: host=${host.javaClass.simpleName}@" +
+                    Integer.toHexString(System.identityHashCode(host)) +
+                    " attached=${it?.javaClass?.name ?: "null"}@" +
+                    (it?.let { asc -> Integer.toHexString(System.identityHashCode(asc)) } ?: "null"),
+            )
+        }.onFailure { Log.w(TAG, "getRootSurfaceControl failed", it) }.getOrNull()
+    }
+
+    private fun scheduleVideoLayerAttach(host: View, width: Int, height: Int, attempt: Int = 0) {
+        pendingVideoLayerAttach?.let { host.removeCallbacks(it) }
+        val task = Runnable {
+            val attachedSc = getAttachedSurfaceControl(host)
+            if (attachedSc == null) {
+                if (attempt >= 12) {
+                    Log.w(TAG, "AttachedSurfaceControl still unavailable after retries; video layer not created")
+                    pendingVideoLayerAttach = null
+                    return@Runnable
+                }
+                Log.i(TAG, "scheduleVideoLayerAttach: retry=$attempt waiting for AttachedSurfaceControl")
+                scheduleVideoLayerAttach(host, width, height, attempt + 1)
+                return@Runnable
+            }
+            Log.i(
+                TAG,
+                "show: root AttachedSurfaceControl=${attachedSc.javaClass.name}@" +
+                    Integer.toHexString(System.identityHashCode(attachedSc)) +
+                    " retry=$attempt",
+            )
+            rootAttachedSurfaceControl = attachedSc
+            pendingVideoLayerAttach = null
+            createVideoLayer(attachedSc, width, height)
+        }
+        pendingVideoLayerAttach = task
+        val delayMs = if (attempt == 0) 0L else 16L
+        if (host.isAttachedToWindow) {
+            host.postDelayed(task, delayMs)
+        } else {
+            host.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.removeOnAttachStateChangeListener(this)
+                    v.postDelayed(task, delayMs)
+                }
+                override fun onViewDetachedFromWindow(v: View) = Unit
+            })
+        }
+    }
+
+    private fun createVideoLayer(parent: AttachedSurfaceControl, width: Int, height: Int) {
+        destroyVideoLayer(notifyNative = false)
+        runCatching {
+            Log.i(
+                TAG,
+                "createVideoLayer: begin ${width}x${height} parent=${parent.javaClass.name}@" +
+                    Integer.toHexString(System.identityHashCode(parent)),
+            )
+            val sc = SurfaceControl.Builder()
+                .setName("lsfg-video-layer")
+                .setBufferSize(width, height)
+                .setFormat(PixelFormat.RGBA_8888)
+                .setOpaque(false)
+                .setHidden(false)
+                .build()
+            val surface = Surface(sc)
+            Log.i(
+                TAG,
+                "createVideoLayer: built layer=${sc} surfaceId=" +
+                    Integer.toHexString(System.identityHashCode(surface)) +
+                    " valid=${surface.isValid}",
+            )
+            val txn = parent.buildReparentTransaction(sc)
+                ?: error("buildReparentTransaction returned null")
+            applyVideoLayerTransform(txn, sc, width, height)
+            txn.setLayer(sc, 0)
+            txn.setVisibility(sc, true)
+            txn.setAlpha(sc, 1.0f)
+            parent.applyTransactionOnDraw(txn)
+            requestMaxRefreshRate(surface)
+            logVideoLayerOwnership("created", parent, sc, surface)
+            applySkipScreenshotToVideoLayer(sc)
+            videoLayerControl = sc
+            producerSurface = surface
+            if (surface.isValid) {
+                Log.i(
+                    TAG,
+                    "createVideoLayer: notifying surfaceReady surfaceId=" +
+                        Integer.toHexString(System.identityHashCode(surface)) +
+                        " ${width}x${height}",
+                )
+                surfaceReadyListener?.invoke(surface, width, height)
+            }
+        }.onFailure {
+            Log.w(TAG, "createVideoLayer failed", it)
+        }
+    }
+
+    private fun updateVideoLayerGeometry(width: Int, height: Int) {
+        val sc = videoLayerControl ?: return
+        runCatching {
+            val txn = SurfaceControl.Transaction()
+            applyVideoLayerTransform(txn, sc, width, height)
+            txn.apply()
+            Log.i(TAG, "Video layer geometry synced to ${width}x${height}")
+            producerSurface?.takeIf { it.isValid }?.let {
+                requestMaxRefreshRate(it)
+                surfaceReadyListener?.invoke(it, width, height)
+            }
+        }.onFailure { Log.w(TAG, "updateVideoLayerGeometry failed", it) }
+    }
+
+    private fun destroyVideoLayer(notifyNative: Boolean = true) {
+        Log.i(
+            TAG,
+            "destroyVideoLayer: notifyNative=$notifyNative surfaceId=" +
+                (producerSurface?.let { Integer.toHexString(System.identityHashCode(it)) } ?: "null") +
+                " layer=$videoLayerControl",
+        )
+        if (notifyNative) {
+            surfaceLostListener?.invoke()
+        }
+        runCatching { producerSurface?.release() }
+        producerSurface = null
+        runCatching { videoLayerControl?.release() }
+        videoLayerControl = null
+    }
+
+    private fun logVideoLayerOwnership(
+        stage: String,
+        parent: AttachedSurfaceControl,
+        sc: SurfaceControl,
+        surface: Surface,
+    ) {
+        Log.i(
+            TAG,
+            "videoLayer[$stage]: attached=${parent.javaClass.name} layer=$sc surface=$surface " +
+                "size=${overlayWidth}x${overlayHeight} valid=${surface.isValid}",
+        )
+    }
+
+    private fun applySkipScreenshotToVideoLayer(sc: SurfaceControl) {
+        runCatching {
+            val txn = SurfaceControl.Transaction()
+            val method = txn.javaClass.getMethod(
+                "setSkipScreenshot",
+                SurfaceControl::class.java,
+                Boolean::class.javaPrimitiveType,
+            )
+            method.invoke(txn, sc, true)
+            txn.apply()
+            Log.i("lsfg-vk-loop", "videoLayer skipScreenshot applied")
+        }.onFailure {
+            Log.w("lsfg-vk-loop", "videoLayer skipScreenshot FAILED (${it.javaClass.simpleName}): ${it.message}")
+        }
     }
 
     /**
@@ -829,29 +966,6 @@ class OverlayManager(private val ctx: Context) {
             })
         }
     }
-
-    private fun startFrameLoop(tex: TextureView) {
-        stopFrameLoop()
-        val cb = object : Choreographer.FrameCallback {
-            override fun doFrame(frameTimeNanos: Long) {
-                if (frameLoopCallback === this) {
-                    tex.invalidate()
-                    Choreographer.getInstance().postFrameCallback(this)
-                }
-            }
-        }
-        frameLoopCallback = cb
-        Choreographer.getInstance().postFrameCallback(cb)
-    }
-
-    private fun stopFrameLoop() {
-        val cb = frameLoopCallback
-        frameLoopCallback = null
-        if (cb != null) {
-            Choreographer.getInstance().removeFrameCallback(cb)
-        }
-    }
-
     companion object {
         private const val TAG = "OverlayManager"
     }
