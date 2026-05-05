@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include "crash_reporter.hpp"
 
@@ -162,6 +163,14 @@ struct State {
     bool     lumaGateOpen      = false;
     uint32_t lumaGateDarkCount = 0;
     int64_t  lumaGateStartNs   = 0; // steady_clock ns at first suppressed dark frame
+
+    // AHB Wrapper Cache: avoids allocating and creating a VkImage for the same AHardwareBuffer
+    // pointer multiple times per session.
+    struct CachedAhbImage {
+        AhbImage image;
+        uint64_t lastUsedFrame;
+    };
+    std::unordered_map<AHardwareBuffer*, CachedAhbImage> ahbCache;
 
     // Pending frames to process. We acquire a ref on the AHB so it survives
     // beyond the caller's Image.close(). Drained by the worker thread.
@@ -1759,13 +1768,28 @@ void workerThread() {
         if (ahb == nullptr) continue;
 
         // Wrap the imported AHB (read-only from our perspective) and copy
-        // into the oldest input slot.
+        // into the oldest input slot. Try to use cached VkImage wrapper to avoid
+        // expensive vkCreateImage/vkAllocateMemory allocations on hot path.
         AhbImage src{};
-        const int rc = importAhbImage(g.vk, ahb, src);
-        if (rc != kOk) {
-            LOGW("importAhbImage failed rc=%d", rc);
-            AHardwareBuffer_release(ahb);
-            continue;
+        bool fromCache = false;
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            auto it = g.ahbCache.find(ahb);
+            if (it != g.ahbCache.end()) {
+                src = it->second.image;
+                it->second.lastUsedFrame = g.framesCopied;
+                fromCache = true;
+            }
+        }
+
+        if (!fromCache) {
+            // Miss: wrap it.
+            const int rc = importAhbImage(g.vk, ahb, src);
+            if (rc != kOk) {
+                LOGW("importAhbImage failed rc=%d", rc);
+                AHardwareBuffer_release(ahb); // release queue-enqueue ref
+                continue;
+            }
         }
 
         // Framegen tracks an internal frameIdx and treats inImg_0 as the
@@ -1816,6 +1840,8 @@ void workerThread() {
             sampleAhb(src.ahb, lbl);
         }
 
+        bool isCached = fromCache;
+
         // Bootstrap: the very first capture has no predecessor, so seed BOTH
         // slots with the same pixels. That makes the optical flow for the first
         // present a no-op (same image on both inputs) and the output equals the
@@ -1824,18 +1850,23 @@ void workerThread() {
             if (!processRealFrameIntoSlot(src, g.inSlot[0]) ||
                     !processRealFrameIntoSlot(src, g.inSlot[1])) {
                 LOGW("bootstrap frame input processing failed");
-                destroyAhbImage(g.vk, src);
+                if (!isCached) {
+                    destroyAhbImage(g.vk, src);
+                }
                 AHardwareBuffer_release(ahb);
                 continue;
             }
         } else {
             if (!processRealFrameIntoSlot(src, g.inSlot[newSlot])) {
                 LOGW("frame input processing failed");
-                destroyAhbImage(g.vk, src);
+                if (!isCached) {
+                    destroyAhbImage(g.vk, src);
+                }
                 AHardwareBuffer_release(ahb);
                 continue;
             }
         }
+
         // Post-copy: verify the destination slot was written correctly.
         // Extended to 8 copies to capture the frame-4 failure.
         if (g.framesCopied < 8) {
@@ -1852,13 +1883,24 @@ void workerThread() {
             }
         }
 
+        // If this was a freshly imported buffer and copy succeeded, add it to the cache
+        if (!isCached) {
+            std::lock_guard<std::mutex> lock(g.mu);
+            // Retain the AHB internally for the cache
+            AHardwareBuffer_acquire(ahb);
+            g.ahbCache[ahb] = {src, g.framesCopied};
+            isCached = true;
+        }
+
         g.framesCopied++;
         bool suppressGeneratedFrames =
             g.antiArtifacts.load(std::memory_order_relaxed)
             && g.framesCopied > 1
             && shouldSuppressGeneratedFrames(g.inSlot[prevSlot], g.inSlot[newSlot]);
 
-        destroyAhbImage(g.vk, src);
+        if (!isCached) {
+            destroyAhbImage(g.vk, src);
+        }
         AHardwareBuffer_release(ahb);
 
         // PROFILE: input copy phase done.
@@ -2497,6 +2539,14 @@ void shutdownRenderLoop() {
         g.gpuPost.reset(g.vk);
         destroyAhbImage(g.vk, g.gpuPostImage);
         for (int i = 0; i < 2; ++i) destroyAhbImage(g.vk, g.inSlot[i]);
+
+        // Clear AHB wrapper cache and release retained references
+        for (auto &pair : g.ahbCache) {
+            destroyAhbImage(g.vk, pair.second.image);
+            AHardwareBuffer_release(pair.first);
+        }
+        g.ahbCache.clear();
+
         g.npuPost.reset();
         g.cpuPost.reset();
 
