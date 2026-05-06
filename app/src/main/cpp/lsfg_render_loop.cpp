@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include "crash_reporter.hpp"
 
@@ -162,6 +163,14 @@ struct State {
     bool     lumaGateOpen      = false;
     uint32_t lumaGateDarkCount = 0;
     int64_t  lumaGateStartNs   = 0; // steady_clock ns at first suppressed dark frame
+
+    // AHB Wrapper Cache: avoids allocating and creating a VkImage for the same AHardwareBuffer
+    // pointer multiple times per session.
+    struct CachedAhbImage {
+        AhbImage image;
+        uint64_t lastUsedFrame;
+    };
+    std::unordered_map<AHardwareBuffer*, CachedAhbImage> ahbCache;
 
     // Pending frames to process. We acquire a ref on the AHB so it survives
     // beyond the caller's Image.close(). Drained by the worker thread.
@@ -531,7 +540,11 @@ void destroySwapchain() {
     if (g.swap.surface != VK_NULL_HANDLE && g.vk.instance != VK_NULL_HANDLE) {
         // Surface destruction uses the instance-level function. volk populates
         // it globally after volkLoadInstance.
-        vkDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        if (g.vk.pfnDestroySurfaceKHR != nullptr) {
+            g.vk.pfnDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        } else {
+            vkDestroySurfaceKHR(g.vk.instance, g.swap.surface, nullptr);
+        }
         g.swap.surface = VK_NULL_HANDLE;
     }
     g.swap.extent = {0, 0};
@@ -604,7 +617,7 @@ bool createSwapchain() {
 
     // Can our compute queue actually present on this surface?
     VkBool32 canPresent = VK_FALSE;
-    const VkResult suppr = vkGetPhysicalDeviceSurfaceSupportKHR(g.vk.physicalDevice,
+    const VkResult suppr = g.vk.pfnGetPhysicalDeviceSurfaceSupportKHR(g.vk.physicalDevice,
             g.vk.computeFamilyIdx, g.swap.surface, &canPresent);
     LOGI("createSwapchain: surfaceSupport rc=%d canPresent=%d", (int)suppr, (int)canPresent);
     if (suppr != VK_SUCCESS || canPresent != VK_TRUE) {
@@ -615,7 +628,7 @@ bool createSwapchain() {
     }
 
     VkSurfaceCapabilitiesKHR caps{};
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.vk.physicalDevice,
+    if (g.vk.pfnGetPhysicalDeviceSurfaceCapabilitiesKHR(g.vk.physicalDevice,
             g.swap.surface, &caps) != VK_SUCCESS) {
         LOGW("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed");
         destroySwapchain();
@@ -625,11 +638,11 @@ bool createSwapchain() {
     // Format: prefer RGBA8 UNORM since that's what framegen outputs. Fall back
     // to whatever the driver offers if not present.
     uint32_t fmtCount = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
+    g.vk.pfnGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
                                          &fmtCount, nullptr);
     std::vector<VkSurfaceFormatKHR> fmts(fmtCount);
     if (fmtCount > 0) {
-        vkGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
+        g.vk.pfnGetPhysicalDeviceSurfaceFormatsKHR(g.vk.physicalDevice, g.swap.surface,
                                              &fmtCount, fmts.data());
     }
     VkSurfaceFormatKHR chosen{VK_FORMAT_R8G8B8A8_UNORM, VK_COLORSPACE_SRGB_NONLINEAR_KHR};
@@ -747,11 +760,14 @@ bool createSwapchain() {
 // Returns true on success. On VK_ERROR_OUT_OF_DATE_KHR or _SUBOPTIMAL_KHR the
 // swapchain is marked dirty; the caller's next blit will recreate it.
 bool blitOutputToSwapchain(const AhbImage &src) {
+    // Note: Called with g.mu held from blitOutputToWindow.
     if (g.swap.swapchain == VK_NULL_HANDLE) return false;
     if (src.image == VK_NULL_HANDLE) return false;
     if (g.swap.outOfDate) {
         if (!createSwapchain()) return false;
     }
+
+    if (g.swap.acquireSems.empty()) return false;
 
     // Pick an acquire semaphore from the round-robin pool. Using a single
     // semaphore risks "semaphore already has a pending wait" on fast backs.
@@ -768,6 +784,11 @@ bool blitOutputToSwapchain(const AhbImage &src) {
     }
     if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
         LOGW("vkAcquireNextImageKHR returned %d", (int)ar);
+        return false;
+    }
+
+    if (imageIdx >= g.swap.images.size()) {
+        LOGW("vkAcquireNextImageKHR returned OOB index %u (size %zu)", imageIdx, g.swap.images.size());
         return false;
     }
 
@@ -1447,6 +1468,7 @@ void blitOutputToWindow(const AhbImage &out, bool allowGpuPost = true) {
     const bool cpuPostActive = g.npuPostProcessing || g.cpuPostProcessing;
     if (kEnableWsiSwapchain && !cpuPostActive && g.vk.hasSwapchain
             && !g.swap.disabledForSession) {
+        std::lock_guard<std::mutex> lock(g.mu);
         if (g.swap.swapchain == VK_NULL_HANDLE) {
             if (!createSwapchain()) {
                 // Mark disabled so subsequent blits don't spin on the
@@ -1710,25 +1732,12 @@ void workerThread() {
     // so a prior session that crashed or left dark content would be visible to
     // MediaProjection immediately, seeding a dark-feedback loop on the very
     // first captured frame.
-    if (g.outWindow != nullptr) {
-        ANativeWindow_setBuffersGeometry(g.outWindow,
-            static_cast<int32_t>(g.outWidth),
-            static_cast<int32_t>(g.outHeight),
-            WINDOW_FORMAT_RGBA_8888);
-        ANativeWindow_Buffer clearBuf{};
-        if (ANativeWindow_lock(g.outWindow, &clearBuf, nullptr) == 0) {
-            memset(clearBuf.bits, 0,
-                   static_cast<size_t>(clearBuf.stride) *
-                   static_cast<size_t>(clearBuf.height) * 4);
-            ANativeWindow_unlockAndPost(g.outWindow);
-            // The BufferQueue is now bound to a CPU producer for this window.
-            // Any later createSwapchain attempt would fail with
-            // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR — pre-pin the taint so we
-            // don't even try (see createSwapchain for rationale).
-            g.windowCpuProducerLocked = true;
-            LOGI("workerThread: cleared overlay to transparent");
-        }
-    }
+    // Skip CPU clearing here if we want to use the Vulkan swapchain path.
+    // Vulkan will clear the screen much more efficiently when it starts.
+    // If we were to call ANativeWindow_lock() here, the window would be
+    // "poisoned" for the rest of the session, forcing us into the slow
+    // CPU blit fallback.
+
 
     // Drain any frames that were buffered during shader compilation.  Those
     // frames were captured while the overlay may have been dark (stale content
@@ -1759,13 +1768,28 @@ void workerThread() {
         if (ahb == nullptr) continue;
 
         // Wrap the imported AHB (read-only from our perspective) and copy
-        // into the oldest input slot.
+        // into the oldest input slot. Try to use cached VkImage wrapper to avoid
+        // expensive vkCreateImage/vkAllocateMemory allocations on hot path.
         AhbImage src{};
-        const int rc = importAhbImage(g.vk, ahb, src);
-        if (rc != kOk) {
-            LOGW("importAhbImage failed rc=%d", rc);
-            AHardwareBuffer_release(ahb);
-            continue;
+        bool fromCache = false;
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            auto it = g.ahbCache.find(ahb);
+            if (it != g.ahbCache.end()) {
+                src = it->second.image;
+                it->second.lastUsedFrame = g.framesCopied;
+                fromCache = true;
+            }
+        }
+
+        if (!fromCache) {
+            // Miss: wrap it.
+            const int rc = importAhbImage(g.vk, ahb, src);
+            if (rc != kOk) {
+                LOGW("importAhbImage failed rc=%d", rc);
+                AHardwareBuffer_release(ahb); // release queue-enqueue ref
+                continue;
+            }
         }
 
         // Framegen tracks an internal frameIdx and treats inImg_0 as the
@@ -1816,6 +1840,8 @@ void workerThread() {
             sampleAhb(src.ahb, lbl);
         }
 
+        bool isCached = fromCache;
+
         // Bootstrap: the very first capture has no predecessor, so seed BOTH
         // slots with the same pixels. That makes the optical flow for the first
         // present a no-op (same image on both inputs) and the output equals the
@@ -1824,18 +1850,23 @@ void workerThread() {
             if (!processRealFrameIntoSlot(src, g.inSlot[0]) ||
                     !processRealFrameIntoSlot(src, g.inSlot[1])) {
                 LOGW("bootstrap frame input processing failed");
-                destroyAhbImage(g.vk, src);
+                if (!isCached) {
+                    destroyAhbImage(g.vk, src);
+                }
                 AHardwareBuffer_release(ahb);
                 continue;
             }
         } else {
             if (!processRealFrameIntoSlot(src, g.inSlot[newSlot])) {
                 LOGW("frame input processing failed");
-                destroyAhbImage(g.vk, src);
+                if (!isCached) {
+                    destroyAhbImage(g.vk, src);
+                }
                 AHardwareBuffer_release(ahb);
                 continue;
             }
         }
+
         // Post-copy: verify the destination slot was written correctly.
         // Extended to 8 copies to capture the frame-4 failure.
         if (g.framesCopied < 8) {
@@ -1852,13 +1883,24 @@ void workerThread() {
             }
         }
 
+        // If this was a freshly imported buffer and copy succeeded, add it to the cache
+        if (!isCached) {
+            std::lock_guard<std::mutex> lock(g.mu);
+            // Retain the AHB internally for the cache
+            AHardwareBuffer_acquire(ahb);
+            g.ahbCache[ahb] = {src, g.framesCopied};
+            isCached = true;
+        }
+
         g.framesCopied++;
         bool suppressGeneratedFrames =
             g.antiArtifacts.load(std::memory_order_relaxed)
             && g.framesCopied > 1
             && shouldSuppressGeneratedFrames(g.inSlot[prevSlot], g.inSlot[newSlot]);
 
-        destroyAhbImage(g.vk, src);
+        if (!isCached) {
+            destroyAhbImage(g.vk, src);
+        }
         AHardwareBuffer_release(ahb);
 
         // PROFILE: input copy phase done.
@@ -2317,9 +2359,12 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
         g.framegenCtxId = -1;
     }
 
+    g.initialized = true;
+
+
+
     g.stopRequested = false;
     g.worker = std::thread(workerThread);
-    g.initialized = true;
     // Do NOT build the swapchain here. At initContext time the overlay's
     // Surface is still owned by the mirror VirtualDisplay producer — it's
     // only detached when setLsfgMode() runs (which retargets the VD to the
@@ -2494,6 +2539,14 @@ void shutdownRenderLoop() {
         g.gpuPost.reset(g.vk);
         destroyAhbImage(g.vk, g.gpuPostImage);
         for (int i = 0; i < 2; ++i) destroyAhbImage(g.vk, g.inSlot[i]);
+
+        // Clear AHB wrapper cache and release retained references
+        for (auto &pair : g.ahbCache) {
+            destroyAhbImage(g.vk, pair.second.image);
+            AHardwareBuffer_release(pair.first);
+        }
+        g.ahbCache.clear();
+
         g.npuPost.reset();
         g.cpuPost.reset();
 
