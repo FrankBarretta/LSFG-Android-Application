@@ -81,6 +81,15 @@ class LsfgForegroundService : Service() {
     private var pendingReinitW: Int = 0
     @Volatile
     private var pendingReinitH: Int = 0
+    // Debounce runnable for geometry-triggered reinits. Wild Rift (and other games
+    // that auto-rotate on launch) fires several rapid onSurfaceReady events as
+    // Android tears down and recreates the Surface during orientation changes. Each
+    // naive reinit takes ~1-2 s (vkDeviceWaitIdle + shader pipeline rebuild), so
+    // chaining 3-4 of them stalls the overlay for 5-8 s and can leave the context
+    // in a mismatched state if the service is torn down mid-reinit. Instead we
+    // post a delayed runnable and cancel any pending one on every new geometry
+    // event — only the final settled orientation actually fires the reinit.
+    private var pendingGeometryReinitRunnable: Runnable? = null
     // Set in onDestroy. While true, new reinit requests are dropped on the
     // floor — we're tearing down the service and any allocation we'd do here
     // would just have to be undone (and would race the shutdown).
@@ -180,6 +189,10 @@ class LsfgForegroundService : Service() {
         // images — SIGSEGV on the next access. This was the "stop overlay
         // crashes when settings stop applying" symptom.
         shuttingDown = true
+        // Cancel any pending debounced geometry reinit — we're shutting down and
+        // don't want it to fire and race with the teardown path below.
+        pendingGeometryReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingGeometryReinitRunnable = null
         stopBenchmarkProgressPoller()
         // Wait on the latch instead of polling — frees the Main thread looper
         // to deliver pending input events instead of sleeping in 20 ms ticks.
@@ -215,6 +228,9 @@ class LsfgForegroundService : Service() {
     }
 
     private fun handleStart(intent: Intent) {
+        // Cancel any leftover debounced geometry reinit from a previous session.
+        pendingGeometryReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingGeometryReinitRunnable = null
         val captureSource = CaptureSource.fromPref(intent.getStringExtra(EXTRA_CAPTURE_SOURCE))
         val isPrivilegedCapture = captureSource == CaptureSource.SHIZUKU || captureSource == CaptureSource.ROOT
         runCatching { NativeBridge.setShizukuTimingEnabled(isPrivilegedCapture) }
@@ -518,8 +534,24 @@ class LsfgForegroundService : Service() {
                 // render loop, just keep the capture alive.
                 cap?.setSurface(surface, w, h)
             } else if (w != activeRenderW || h != activeRenderH) {
-                LsfgLog.i(TAG, "Surface geometry changed ${activeRenderW}x${activeRenderH} -> ${w}x${h}; reinitializing LSFG context")
-                reinitLsfgContext(w, h)
+                // Debounce the reinit: cancel any previously pending geometry reinit
+                // and schedule a new one. This coalesces rapid orientation changes
+                // (portrait->landscape->portrait in quick succession during game launch)
+                // into a single reinit on the final settled orientation instead of
+                // triggering one expensive pipeline rebuild per intermediate event.
+                pendingGeometryReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+                LsfgLog.i(TAG, "Surface geometry changed ${activeRenderW}x${activeRenderH} -> ${w}x${h}; scheduling debounced reinit")
+                val r = Runnable {
+                    pendingGeometryReinitRunnable = null
+                    val sw = lastSurfaceW
+                    val sh = lastSurfaceH
+                    if (sw > 0 && sh > 0 && !shuttingDown) {
+                        LsfgLog.i(TAG, "Debounced geometry reinit: ${sw}x${sh}")
+                        reinitLsfgContext(sw, sh)
+                    }
+                }
+                pendingGeometryReinitRunnable = r
+                mainHandler.postDelayed(r, GEOMETRY_REINIT_DEBOUNCE_MS)
             }
         }
         ov.onSurfaceLost {
@@ -737,10 +769,27 @@ class LsfgForegroundService : Service() {
                     // handle, so initContext() came up with no output surface attached.
                     // Without this re-attach, blitOutputToWindow() short-circuits and
                     // the overlay freezes on whatever was last posted.
+                    //
+                    // Use the LATEST surface dimensions, not targetW/H. A rapid
+                    // orientation change can update lastSurface/lastSurfaceW/H while
+                    // this reinit thread was running initContext() for the previous
+                    // orientation. Attaching a 2400x1080 Surface with targetW=1080 /
+                    // targetH=2400 causes a dimension mismatch in the native blit path
+                    // and typically leaves the overlay frozen or cropped. If the
+                    // dimensions DID change while we were busy, mark a follow-up reinit
+                    // so the do-while loop picks it up with the correct size.
                     val surface = lastSurface
+                    val latestW = lastSurfaceW.takeIf { it > 0 } ?: targetW
+                    val latestH = lastSurfaceH.takeIf { it > 0 } ?: targetH
                     if (surface != null) {
-                        runCatching { NativeBridge.setOutputSurface(surface, targetW, targetH) }
+                        runCatching { NativeBridge.setOutputSurface(surface, latestW, latestH) }
                             .onFailure { LsfgLog.w(TAG, "setOutputSurface (re-init) failed", it) }
+                        if ((latestW != targetW || latestH != targetH) && !reinitRequested) {
+                            LsfgLog.i(TAG, "Surface changed during reinit: target=${targetW}x${targetH} latest=${latestW}x${latestH} — queuing follow-up reinit")
+                            pendingReinitW = latestW
+                            pendingReinitH = latestH
+                            reinitRequested = true
+                        }
                     } else {
                         LsfgLog.w(TAG, "reinit: no cached surface to re-attach")
                     }
@@ -1026,6 +1075,12 @@ class LsfgForegroundService : Service() {
         const val EXTRA_TARGET_PACKAGE = "target_package"
         const val EXTRA_FPS_COUNTER = "fps_counter"
         const val EXTRA_CAPTURE_SOURCE = "capture_source"
+        // Debounce window for geometry-triggered reinits (ms). Games that auto-rotate
+        // on launch (e.g. Wild Rift) can fire 3-4 rapid onSurfaceReady events in
+        // ~500 ms; we wait this long after the LAST event before actually starting
+        // the expensive context rebuild, so only the final settled orientation pays
+        // the reinit cost.
+        const val GEOMETRY_REINIT_DEBOUNCE_MS = 400L
         // When true, after framegen reaches steady state the service hands
         // control to BenchmarkController which runs three back-to-back passes
         // (multiplier x2/x3/x4) and produces a shareable report. The session
