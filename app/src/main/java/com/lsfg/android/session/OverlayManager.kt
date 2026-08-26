@@ -162,6 +162,7 @@ class OverlayManager(private val ctx: Context) {
         // captured frame black. Exclusion from capture is handled by installSkipScreenshot
         // via the eSkipScreenshot SurfaceFlinger layer flag instead.
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
