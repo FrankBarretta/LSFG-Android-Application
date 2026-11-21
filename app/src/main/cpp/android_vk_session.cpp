@@ -254,7 +254,28 @@ int create_session(VulkanSession &out) {
     std::vector<const char *> enabledExts;
     for (const char *req : kRequiredDeviceExt) enabledExts.push_back(req);
     bool hasSwapchainDevExt = false;
+    // The extension alone does not guarantee nullDescriptor; requesting an
+    // unsupported feature is invalid usage. Same probe as framegen's device.cpp
+    // so both devices agree on the descriptor path.
+    bool r2NullDescriptor = false;
+    if (has_extension(avail, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceRobustness2FeaturesEXT r2Probe{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+        };
+        VkPhysicalDeviceFeatures2 r2Feats{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &r2Probe,
+        };
+        vkGetPhysicalDeviceFeatures2(out.physicalDevice, &r2Feats);
+        r2NullDescriptor = r2Probe.nullDescriptor == VK_TRUE;
+        LOGI("robustness2 features: robustBufferAccess2=%d robustImageAccess2=%d nullDescriptor=%d",
+             (int)r2Probe.robustBufferAccess2, (int)r2Probe.robustImageAccess2,
+             (int)r2Probe.nullDescriptor);
+    }
     for (const char *opt : kOptionalDeviceExt) {
+        if (std::strcmp(opt, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0 && !r2NullDescriptor) {
+            continue;  // handled by the fallback-descriptor INFO below
+        }
         if (has_extension(avail, opt)) {
             enabledExts.push_back(opt);
             if (std::strcmp(opt, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0) {

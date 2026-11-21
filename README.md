@@ -8,10 +8,11 @@ generated frames into a system overlay sitting on top of the target game.
 
 > [!NOTE]
 > Sideload-only. End-to-end frame generation works on Adreno 7xx-class GPUs
-> and newer (Snapdragon 8 Gen 2 / Gen 3 / Gen 4 verified). Older Adreno and
-> most Mali devices are missing `VK_EXT_robustness2` and fall back to
-> capture-only mirror mode (the overlay still shows the game, no
-> interpolation).
+> and newer (Snapdragon 8 Gen 2 / Gen 3 / Gen 4 verified), and on Adreno 650
+> (Snapdragon 865, Retroid Pocket Flip 2, Android 13, Vulkan 1.1.128) at
+> 30 -> 60 fps with `flow scale 0.5` + performance mode. Devices whose driver
+> lacks `VK_EXT_robustness2` use a 1x1 fallback descriptor instead of
+> `nullDescriptor`.
 
 ## What's in the box
 
@@ -232,13 +233,19 @@ build falls back to the debug signing config.
 
 ## Required device features
 
-- **Vulkan 1.2+**.
+- **Vulkan 1.2+**, or Vulkan 1.1 with `VK_KHR_timeline_semaphore`,
+  `VK_KHR_synchronization2` and `VK_KHR_vulkan_memory_model` (verified on
+  Adreno 650, API 1.1.128).
 - `VK_ANDROID_external_memory_android_hardware_buffer`.
 - `VK_KHR_external_memory` + `VK_KHR_sampler_ycbcr_conversion`.
-- **`VK_EXT_robustness2`** — required by framegen for `nullDescriptor`.
-  Available on recent Adreno (≥ 7xx-class). If absent, the session creates
-  fine but `LSFG_3_1::initialize` throws and the app falls back to
-  capture-only mirror mode.
+- `VK_EXT_robustness2` with the `nullDescriptor` feature: optional. Both
+  devices query the feature before requesting it; when it is absent framegen
+  binds a 1x1 fallback descriptor image.
+- **Android 13** (verified; older releases untested): the overlay is excluded from MediaProjection
+  through `SurfaceControl.Transaction.setSkipScreenshot`, a hidden API. The
+  app calls `HiddenApiBypass.addHiddenApiExemptions` at startup; without it
+  the reflection is denied, MediaProjection captures the overlay itself and
+  the output becomes a frozen, ghosted feedback image.
 - `VK_EXT_queue_family_foreign` — recommended; used for AHB ownership
   transitions. Falls back to `VK_QUEUE_FAMILY_EXTERNAL` when absent.
 

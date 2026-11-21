@@ -145,6 +145,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    // Android 13 blocks the @hide reflection that OverlayManager.installSkipScreenshot
+    // needs; without it MediaProjection captures our own overlay (feedback loop).
+    // Scoped to this app only, unlike the global hidden_api_policy setting.
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("com.github.topjohnwu.libsu:core:5.3.0")
